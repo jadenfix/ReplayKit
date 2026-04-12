@@ -1,0 +1,15 @@
+[package]
+name = "replaykit-sdk-rust-tracing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "replaykit_sdk_rust_tracing"
+path = "src/lib.rs"
+
+[dependencies]
+replaykit-core-model = { path = "../core-model" }
+replaykit-collector = { path = "../collector" }
+replaykit-storage = { path = "../storage" }

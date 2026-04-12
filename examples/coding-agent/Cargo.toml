@@ -1,0 +1,17 @@
+[package]
+name = "replaykit-example-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "coding-agent-example"
+path = "src/main.rs"
+
+[dependencies]
+replaykit-api = { path = "../../crates/api" }
+replaykit-core-model = { path = "../../crates/core-model" }
+replaykit-storage = { path = "../../crates/storage" }
+replaykit-sdk-rust-tracing = { path = "../../crates/sdk-rust-tracing" }
+replaykit-replay-engine = { path = "../../crates/replay-engine" }

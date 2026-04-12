@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/core-model",
+    "crates/storage",
+    "crates/collector",
+    "crates/replay-engine",
+    "crates/diff-engine",
+    "crates/api",
+    "crates/sdk-rust-tracing",
+    "crates/cli",
+    "examples/coding-agent",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+authors = ["ReplayKit"]
+
+[workspace.lints.clippy]
+all = "allow"
