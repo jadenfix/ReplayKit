@@ -3,9 +3,9 @@ use std::fmt;
 use std::sync::{Arc, RwLock};
 
 use replaykit_core_model::{
-    ArtifactId, ArtifactRecord, BranchId, BranchRecord, DirtySpanRecord, EventRecord, ReplayJobId,
-    ReplayJobRecord, RunDiffRecord, RunId, RunRecord, SnapshotId, SnapshotRecord, SpanEdgeRecord,
-    SpanId, SpanRecord,
+    ArtifactId, ArtifactRecord, BranchId, BranchRecord, DirtySpanRecord, EventRecord, IdKind,
+    ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId, RunRecord, SnapshotId, SnapshotRecord,
+    SpanEdgeRecord, SpanId, SpanRecord,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,7 @@ impl fmt::Display for StorageError {
 }
 
 pub trait Storage: Send + Sync {
+    fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError>;
     fn next_sequence(&self, run_id: &RunId) -> Result<u64, StorageError>;
     fn insert_run(&self, run: RunRecord) -> Result<(), StorageError>;
     fn update_run(&self, run: RunRecord) -> Result<(), StorageError>;
@@ -88,6 +89,7 @@ struct MemoryState {
     replay_jobs: BTreeMap<ReplayJobId, ReplayJobRecord>,
     diffs: BTreeMap<(RunId, RunId), RunDiffRecord>,
     sequences: BTreeMap<RunId, u64>,
+    id_counters: BTreeMap<IdKind, u64>,
 }
 
 #[derive(Clone, Default)]
@@ -104,12 +106,24 @@ impl InMemoryStorage {
         if state.runs.contains_key(run_id) {
             Ok(())
         } else {
-            Err(StorageError::NotFound(format!("run {:?} not found", run_id.0)))
+            Err(StorageError::NotFound(format!(
+                "run {:?} not found",
+                run_id.0
+            )))
         }
     }
 }
 
 impl Storage for InMemoryStorage {
+    fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError> {
+        let mut state = self.state.write().map_err(|_| {
+            StorageError::Internal("failed to lock storage for id allocation".into())
+        })?;
+        let next = state.id_counters.entry(kind).or_insert(0);
+        *next += 1;
+        Ok(format!("{}-{next:016x}", kind.prefix()))
+    }
+
     fn next_sequence(&self, run_id: &RunId) -> Result<u64, StorageError> {
         let mut state = self
             .state
@@ -216,12 +230,15 @@ impl Storage for InMemoryStorage {
     }
 
     fn insert_event(&self, event: EventRecord) -> Result<(), StorageError> {
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| StorageError::Internal("failed to lock storage for event insert".into()))?;
+        let mut state = self.state.write().map_err(|_| {
+            StorageError::Internal("failed to lock storage for event insert".into())
+        })?;
         Self::ensure_run_exists(&state, &event.run_id)?;
-        state.events.entry(event.run_id.clone()).or_default().push(event);
+        state
+            .events
+            .entry(event.run_id.clone())
+            .or_default()
+            .push(event);
         Ok(())
     }
 
@@ -333,7 +350,11 @@ impl Storage for InMemoryStorage {
             .write()
             .map_err(|_| StorageError::Internal("failed to lock storage for edge insert".into()))?;
         Self::ensure_run_exists(&state, &edge.run_id)?;
-        state.edges.entry(edge.run_id.clone()).or_default().push(edge);
+        state
+            .edges
+            .entry(edge.run_id.clone())
+            .or_default()
+            .push(edge);
         Ok(())
     }
 
@@ -502,7 +523,24 @@ mod tests {
         storage.upsert_span(span.clone()).unwrap();
 
         assert_eq!(storage.get_run(&run.run_id).unwrap().title, "demo");
-        assert_eq!(storage.get_span(&run.run_id, &span.span_id).unwrap().name, "root");
+        assert_eq!(
+            storage.get_span(&run.run_id, &span.span_id).unwrap().name,
+            "root"
+        );
         assert_eq!(storage.list_spans(&run.run_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn allocates_unique_ids_across_calls() {
+        let storage = InMemoryStorage::new();
+
+        let first_run = storage.allocate_id(IdKind::Run).unwrap();
+        let second_run = storage.allocate_id(IdKind::Run).unwrap();
+        let first_span = storage.allocate_id(IdKind::Span).unwrap();
+
+        assert_ne!(first_run, second_run);
+        assert!(first_run.starts_with("run-"));
+        assert!(second_run.starts_with("run-"));
+        assert!(first_span.starts_with("span-"));
     }
 }

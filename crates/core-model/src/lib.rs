@@ -219,6 +219,20 @@ pub enum ArtifactType {
     PatchManifest,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IdKind {
+    Run,
+    Trace,
+    Span,
+    Event,
+    Artifact,
+    Snapshot,
+    Edge,
+    Branch,
+    ReplayJob,
+    Diff,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostMetadata {
     pub os: String,
@@ -453,5 +467,22 @@ impl RunRecord {
 impl SpanRecord {
     pub fn is_terminal(&self) -> bool {
         self.ended_at.is_some()
+    }
+}
+
+impl IdKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            IdKind::Run => "run",
+            IdKind::Trace => "trace",
+            IdKind::Span => "span",
+            IdKind::Event => "event",
+            IdKind::Artifact => "artifact",
+            IdKind::Snapshot => "snapshot",
+            IdKind::Edge => "edge",
+            IdKind::Branch => "branch",
+            IdKind::ReplayJob => "job",
+            IdKind::Diff => "diff",
+        }
     }
 }

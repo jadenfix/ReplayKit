@@ -44,7 +44,10 @@ fn main() {
                 println!("  - {} {:?}", dirty.span_id.0, dirty.reasons);
             }
             let diff = service
-                .cached_diff(&execution.branch.source_run_id, &execution.branch.target_run_id)
+                .cached_diff(
+                    &execution.branch.source_run_id,
+                    &execution.branch.target_run_id,
+                )
                 .expect("cached diff");
             println!(
                 "diff summary: changed_spans={} first_divergent={}",

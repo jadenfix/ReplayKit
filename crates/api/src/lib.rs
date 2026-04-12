@@ -120,7 +120,9 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         span_id: &SpanId,
         spec: EndSpan,
     ) -> Result<SpanRecord, ApiError> {
-        self.collector.end_span(run_id, span_id, spec).map_err(Into::into)
+        self.collector
+            .end_span(run_id, span_id, spec)
+            .map_err(Into::into)
     }
 
     pub fn finish_run(
@@ -160,14 +162,11 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
 
     pub fn create_branch(&self, request: BranchRequest) -> Result<BranchExecution, ApiError> {
         let execution = self.replay.execute_fork(request)?;
-        let _ = self
-            .diff
-            .diff_runs(
-                &execution.branch.source_run_id,
-                &execution.branch.target_run_id,
-                execution.branch.created_at,
-            )
-            .ok();
+        self.diff.diff_runs(
+            &execution.branch.source_run_id,
+            &execution.branch.target_run_id,
+            execution.branch.created_at,
+        )?;
         Ok(execution)
     }
 
@@ -206,4 +205,297 @@ fn build_tree(
             children: build_tree(Some(span.span_id.clone()), by_parent),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use replaykit_collector::{ArtifactSpec, BeginRun, EndSpan, SpanSpec};
+    use replaykit_core_model::{
+        ArtifactType, BranchRequest, CostMetrics, Document, HostMetadata, PatchManifest, PatchType,
+        ReplayPolicy, RunStatus, SpanId, SpanKind, SpanStatus, Value,
+    };
+    use replaykit_replay_engine::{ExecutionResult, ProducedArtifact, ReplayExecutionContext};
+    use replaykit_storage::InMemoryStorage;
+
+    use super::*;
+
+    struct FakeExecutorRegistry;
+
+    impl ExecutorRegistry for FakeExecutorRegistry {
+        fn supports(&self, span: &SpanRecord) -> bool {
+            span.kind == SpanKind::LlmCall
+        }
+
+        fn execute(
+            &self,
+            span: &SpanRecord,
+            _context: &ReplayExecutionContext,
+        ) -> Result<ExecutionResult, replaykit_replay_engine::ReplayError> {
+            Ok(ExecutionResult {
+                status: SpanStatus::Completed,
+                output_artifacts: vec![ProducedArtifact {
+                    artifact_type: ArtifactType::ModelResponse,
+                    mime: "application/json".into(),
+                    sha256: "patched-answer".into(),
+                    byte_len: 1,
+                    blob_path: "memory://patched-answer".into(),
+                    summary: summary_from_pairs(&[("answer", "patched answer")]),
+                    redaction: Document::new(),
+                    created_at: 10,
+                }],
+                output_fingerprint: Some(format!("replayed:{}", span.span_id.0)),
+                snapshot: None,
+                error_summary: None,
+                cost: CostMetrics {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    estimated_cost_micros: 3,
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn create_branch_persists_diff_and_replays_downstream() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage.clone(), FakeExecutorRegistry);
+        let run = seed_run(&service);
+
+        let execution = service
+            .create_branch(BranchRequest {
+                source_run_id: run.run_id.clone(),
+                fork_span_id: SpanId("tool".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::ToolOutputOverride,
+                    target_artifact_id: None,
+                    replacement: Value::Text("patched tool result".into()),
+                    note: None,
+                    created_at: 20,
+                },
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+
+        assert_eq!(execution.target_run.status, RunStatus::Completed);
+        let diff = service
+            .cached_diff(
+                &execution.branch.source_run_id,
+                &execution.branch.target_run_id,
+            )
+            .unwrap();
+        assert!(diff.changed_span_count >= 2);
+
+        let answer = storage
+            .get_span(&execution.target_run.run_id, &SpanId("answer".into()))
+            .unwrap();
+        assert_eq!(answer.status, SpanStatus::Completed);
+        assert_eq!(
+            answer.output_fingerprint.as_deref(),
+            Some("replayed:answer")
+        );
+        assert_eq!(answer.output_artifact_ids.len(), 1);
+    }
+
+    #[test]
+    fn shared_storage_allocates_unique_run_ids_across_services() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let first = ReplayKitService::new(storage.clone(), FakeExecutorRegistry);
+        let second = ReplayKitService::new(storage, FakeExecutorRegistry);
+
+        let first_run = first.begin_run(sample_begin_run("one")).unwrap();
+        let second_run = second.begin_run(sample_begin_run("two")).unwrap();
+
+        assert_ne!(first_run.run_id, second_run.run_id);
+        assert_ne!(first_run.trace_id, second_run.trace_id);
+    }
+
+    fn seed_run(service: &ReplayKitService<InMemoryStorage, FakeExecutorRegistry>) -> RunRecord {
+        let run = service.begin_run(sample_begin_run("demo")).unwrap();
+
+        let planner = service
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("planner".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::PlannerStep,
+                    name: "planner".into(),
+                    started_at: 1,
+                    replay_policy: ReplayPolicy::RecordOnly,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        service
+            .end_span(
+                &run.run_id,
+                &planner.span_id,
+                EndSpan {
+                    ended_at: 2,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: Vec::new(),
+                    snapshot_id: None,
+                    output_fingerprint: Some("planner".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap();
+
+        let tool = service
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("tool".into())),
+                    parent_span_id: Some(planner.span_id.clone()),
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 3,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        let tool_artifact = service
+            .add_artifact(
+                &run.run_id,
+                Some(&tool.span_id),
+                ArtifactSpec {
+                    artifact_type: ArtifactType::ToolOutput,
+                    mime: "application/json".into(),
+                    sha256: "tool-output".into(),
+                    byte_len: 1,
+                    blob_path: "memory://tool-output".into(),
+                    summary: summary_from_pairs(&[("tool", "initial tool output")]),
+                    redaction: Document::new(),
+                    created_at: 4,
+                },
+            )
+            .unwrap();
+        service
+            .end_span(
+                &run.run_id,
+                &tool.span_id,
+                EndSpan {
+                    ended_at: 4,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: vec![tool_artifact.artifact_id],
+                    snapshot_id: None,
+                    output_fingerprint: Some("tool-out".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap();
+
+        let answer = service
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("answer".into())),
+                    parent_span_id: Some(planner.span_id.clone()),
+                    kind: SpanKind::LlmCall,
+                    name: "answer".into(),
+                    started_at: 5,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: Some("fake-llm".into()),
+                    executor_version: Some("v1".into()),
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: Some("answer-in".into()),
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        let answer_artifact = service
+            .add_artifact(
+                &run.run_id,
+                Some(&answer.span_id),
+                ArtifactSpec {
+                    artifact_type: ArtifactType::ModelResponse,
+                    mime: "application/json".into(),
+                    sha256: "answer-output".into(),
+                    byte_len: 1,
+                    blob_path: "memory://answer-output".into(),
+                    summary: summary_from_pairs(&[("answer", "failed answer")]),
+                    redaction: Document::new(),
+                    created_at: 6,
+                },
+            )
+            .unwrap();
+        service
+            .end_span(
+                &run.run_id,
+                &answer.span_id,
+                EndSpan {
+                    ended_at: 6,
+                    status: SpanStatus::Failed,
+                    output_artifact_ids: vec![answer_artifact.artifact_id],
+                    snapshot_id: None,
+                    output_fingerprint: Some("answer-out".into()),
+                    error_code: None,
+                    error_summary: Some("failed".into()),
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap();
+
+        service
+            .add_edge(
+                &run.run_id,
+                replaykit_collector::EdgeSpec {
+                    from_span_id: tool.span_id,
+                    to_span_id: answer.span_id,
+                    kind: replaykit_core_model::EdgeKind::DataDependsOn,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        service
+            .finish_run(&run.run_id, 7, RunStatus::Failed, Some("failed".into()))
+            .unwrap()
+    }
+
+    fn sample_begin_run(title: &str) -> BeginRun {
+        BeginRun {
+            title: title.into(),
+            entrypoint: "agent.main".into(),
+            adapter_name: "test".into(),
+            adapter_version: "0.1.0".into(),
+            started_at: 1,
+            git_sha: None,
+            environment_fingerprint: None,
+            host: HostMetadata {
+                os: "macos".into(),
+                arch: "arm64".into(),
+                hostname: None,
+            },
+            labels: Vec::new(),
+        }
+    }
+
+    fn summary_from_pairs(pairs: &[(&str, &str)]) -> Document {
+        let mut summary = Document::new();
+        for (key, value) in pairs {
+            summary.insert((*key).into(), Value::Text((*value).into()));
+        }
+        summary
+    }
 }

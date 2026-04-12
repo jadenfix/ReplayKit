@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use replaykit_core_model::{
     ArtifactId, ArtifactRecord, ArtifactType, BranchRequest, CostMetrics, Document, EdgeId,
-    EdgeKind, EventId, EventRecord, HostMetadata, PatchType, ReplayPolicy, RunId, RunRecord,
-    RunStatus, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanKind, SpanRecord,
+    EdgeKind, EventId, EventRecord, HostMetadata, IdKind, PatchType, ReplayPolicy, RunId,
+    RunRecord, RunStatus, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanKind, SpanRecord,
     SpanStatus, TraceId, Value,
 };
 use replaykit_storage::{Storage, StorageError};
@@ -110,15 +109,11 @@ pub struct EdgeSpec {
 
 pub struct Collector<S: Storage> {
     storage: Arc<S>,
-    ids: AtomicU64,
 }
 
 impl<S: Storage> Collector<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self {
-            storage,
-            ids: AtomicU64::new(1),
-        }
+        Self { storage }
     }
 
     pub fn storage(&self) -> &Arc<S> {
@@ -126,8 +121,8 @@ impl<S: Storage> Collector<S> {
     }
 
     pub fn begin_run(&self, request: BeginRun) -> Result<RunRecord, CollectorError> {
-        let run_id = RunId(self.next_id("run"));
-        let trace_id = TraceId(self.next_id("trace"));
+        let run_id = RunId(self.allocate_id(IdKind::Run)?);
+        let trace_id = TraceId(self.allocate_id(IdKind::Trace)?);
         let mut run = RunRecord::new(
             run_id.clone(),
             trace_id,
@@ -151,10 +146,23 @@ impl<S: Storage> Collector<S> {
         trace_id: &TraceId,
         spec: SpanSpec,
     ) -> Result<SpanRecord, CollectorError> {
+        self.ensure_run_exists(run_id)?;
         let sequence_no = self.storage.next_sequence(run_id)?;
-        let span_id = spec
-            .span_id
-            .unwrap_or_else(|| SpanId(self.next_id("span")));
+        if let Some(parent_span_id) = &spec.parent_span_id {
+            self.ensure_span_exists(run_id, parent_span_id)?;
+        }
+        let span_id = match spec.span_id {
+            Some(span_id) => {
+                if self.storage.get_span(run_id, &span_id).is_ok() {
+                    return Err(CollectorError::InvalidInput(format!(
+                        "span {:?} already exists in run {:?}",
+                        span_id.0, run_id.0
+                    )));
+                }
+                span_id
+            }
+            None => SpanId(self.allocate_id(IdKind::Span)?),
+        };
         let span = SpanRecord {
             run_id: run_id.clone(),
             span_id,
@@ -191,6 +199,28 @@ impl<S: Storage> Collector<S> {
         update: EndSpan,
     ) -> Result<SpanRecord, CollectorError> {
         let mut span = self.storage.get_span(run_id, span_id)?;
+        for artifact_id in &update.output_artifact_ids {
+            let artifact = self.lookup_artifact(
+                run_id,
+                artifact_id,
+                format!(
+                    "output artifact {:?} was not found in run {:?}",
+                    artifact_id.0, run_id.0
+                ),
+            )?;
+            self.ensure_artifact_attached_to_span(&artifact, span_id, "output artifact")?;
+        }
+        if let Some(snapshot_id) = &update.snapshot_id {
+            let snapshot = self.lookup_snapshot(
+                run_id,
+                snapshot_id,
+                format!(
+                    "snapshot {:?} was not found in run {:?}",
+                    snapshot_id.0, run_id.0
+                ),
+            )?;
+            self.ensure_snapshot_attached_to_span(&snapshot, span_id)?;
+        }
         span.ended_at = Some(update.ended_at);
         span.status = update.status;
         span.output_artifact_ids = update.output_artifact_ids;
@@ -209,8 +239,9 @@ impl<S: Storage> Collector<S> {
         span_id: &SpanId,
         spec: EventSpec,
     ) -> Result<EventRecord, CollectorError> {
+        self.ensure_span_exists(run_id, span_id)?;
         let event = EventRecord {
-            event_id: EventId(self.next_id("event")),
+            event_id: EventId(self.allocate_id(IdKind::Event)?),
             run_id: run_id.clone(),
             span_id: span_id.clone(),
             sequence_no: self.storage.next_sequence(run_id)?,
@@ -228,8 +259,12 @@ impl<S: Storage> Collector<S> {
         span_id: Option<&SpanId>,
         spec: ArtifactSpec,
     ) -> Result<ArtifactRecord, CollectorError> {
+        self.ensure_run_exists(run_id)?;
+        if let Some(span_id) = span_id {
+            self.ensure_span_exists(run_id, span_id)?;
+        }
         let artifact = ArtifactRecord {
-            artifact_id: ArtifactId(self.next_id("artifact")),
+            artifact_id: ArtifactId(self.allocate_id(IdKind::Artifact)?),
             run_id: run_id.clone(),
             span_id: span_id.cloned(),
             artifact_type: spec.artifact_type,
@@ -251,8 +286,21 @@ impl<S: Storage> Collector<S> {
         span_id: Option<&SpanId>,
         spec: SnapshotSpec,
     ) -> Result<SnapshotRecord, CollectorError> {
+        self.ensure_run_exists(run_id)?;
+        let artifact = self.lookup_artifact(
+            run_id,
+            &spec.artifact_id,
+            format!(
+                "snapshot artifact {:?} was not found in run {:?}",
+                spec.artifact_id.0, run_id.0
+            ),
+        )?;
+        if let Some(span_id) = span_id {
+            self.ensure_span_exists(run_id, span_id)?;
+            self.ensure_artifact_attached_to_span(&artifact, span_id, "snapshot artifact")?;
+        }
         let snapshot = SnapshotRecord {
-            snapshot_id: SnapshotId(self.next_id("snapshot")),
+            snapshot_id: SnapshotId(self.allocate_id(IdKind::Snapshot)?),
             run_id: run_id.clone(),
             span_id: span_id.cloned(),
             kind: spec.kind,
@@ -264,9 +312,16 @@ impl<S: Storage> Collector<S> {
         Ok(snapshot)
     }
 
-    pub fn add_edge(&self, run_id: &RunId, spec: EdgeSpec) -> Result<SpanEdgeRecord, CollectorError> {
+    pub fn add_edge(
+        &self,
+        run_id: &RunId,
+        spec: EdgeSpec,
+    ) -> Result<SpanEdgeRecord, CollectorError> {
+        self.ensure_run_exists(run_id)?;
+        self.ensure_span_exists(run_id, &spec.from_span_id)?;
+        self.ensure_span_exists(run_id, &spec.to_span_id)?;
         let edge = SpanEdgeRecord {
-            edge_id: EdgeId(self.next_id("edge")),
+            edge_id: EdgeId(self.allocate_id(IdKind::Edge)?),
             run_id: run_id.clone(),
             from_span_id: spec.from_span_id,
             to_span_id: spec.to_span_id,
@@ -346,7 +401,10 @@ impl<S: Storage> Collector<S> {
         request: &BranchRequest,
     ) -> Result<ArtifactRecord, CollectorError> {
         let summary = Self::encode_patch_manifest(request);
-        let sha256 = format!("patch-{}", self.ids.load(Ordering::SeqCst));
+        let sha256 = format!(
+            "patch:{}:{}:{}",
+            request.source_run_id.0, request.fork_span_id.0, request.patch_manifest.created_at
+        );
         self.add_artifact(
             run_id,
             Some(&request.fork_span_id),
@@ -363,9 +421,92 @@ impl<S: Storage> Collector<S> {
         )
     }
 
-    fn next_id(&self, prefix: &str) -> String {
-        let value = self.ids.fetch_add(1, Ordering::SeqCst);
-        format!("{prefix}-{value:016x}")
+    fn allocate_id(&self, kind: IdKind) -> Result<String, CollectorError> {
+        self.storage.allocate_id(kind).map_err(Into::into)
+    }
+
+    fn ensure_run_exists(&self, run_id: &RunId) -> Result<(), CollectorError> {
+        self.storage.get_run(run_id).map(|_| ()).map_err(|err| {
+            self.not_found_as_invalid_input(err, format!("run {:?} was not found", run_id.0))
+        })
+    }
+
+    fn ensure_span_exists(&self, run_id: &RunId, span_id: &SpanId) -> Result<(), CollectorError> {
+        self.storage
+            .get_span(run_id, span_id)
+            .map(|_| ())
+            .map_err(|err| {
+                self.not_found_as_invalid_input(
+                    err,
+                    format!("span {:?} was not found in run {:?}", span_id.0, run_id.0),
+                )
+            })
+    }
+
+    fn ensure_artifact_attached_to_span(
+        &self,
+        artifact: &ArtifactRecord,
+        span_id: &SpanId,
+        label: &str,
+    ) -> Result<(), CollectorError> {
+        match &artifact.span_id {
+            Some(existing_span_id) if existing_span_id == span_id => Ok(()),
+            Some(existing_span_id) => Err(CollectorError::InvalidInput(format!(
+                "{label} {:?} belongs to span {:?}, not {:?}",
+                artifact.artifact_id.0, existing_span_id.0, span_id.0
+            ))),
+            None => Err(CollectorError::InvalidInput(format!(
+                "{label} {:?} is not attached to span {:?}",
+                artifact.artifact_id.0, span_id.0
+            ))),
+        }
+    }
+
+    fn ensure_snapshot_attached_to_span(
+        &self,
+        snapshot: &SnapshotRecord,
+        span_id: &SpanId,
+    ) -> Result<(), CollectorError> {
+        match &snapshot.span_id {
+            Some(existing_span_id) if existing_span_id == span_id => Ok(()),
+            Some(existing_span_id) => Err(CollectorError::InvalidInput(format!(
+                "snapshot {:?} belongs to span {:?}, not {:?}",
+                snapshot.snapshot_id.0, existing_span_id.0, span_id.0
+            ))),
+            None => Err(CollectorError::InvalidInput(format!(
+                "snapshot {:?} is not attached to span {:?}",
+                snapshot.snapshot_id.0, span_id.0
+            ))),
+        }
+    }
+
+    fn lookup_artifact(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+        not_found_message: String,
+    ) -> Result<ArtifactRecord, CollectorError> {
+        self.storage
+            .get_artifact(run_id, artifact_id)
+            .map_err(|err| self.not_found_as_invalid_input(err, not_found_message))
+    }
+
+    fn lookup_snapshot(
+        &self,
+        run_id: &RunId,
+        snapshot_id: &SnapshotId,
+        not_found_message: String,
+    ) -> Result<SnapshotRecord, CollectorError> {
+        self.storage
+            .get_snapshot(run_id, snapshot_id)
+            .map_err(|err| self.not_found_as_invalid_input(err, not_found_message))
+    }
+
+    fn not_found_as_invalid_input(&self, error: StorageError, message: String) -> CollectorError {
+        match error {
+            StorageError::NotFound(_) => CollectorError::InvalidInput(message),
+            other => CollectorError::Storage(other),
+        }
     }
 }
 
@@ -377,5 +518,147 @@ pub fn patch_type_label(value: PatchType) -> &'static str {
         PatchType::ModelConfigEdit => "model-config-edit",
         PatchType::RetrievalContextOverride => "retrieval-context-override",
         PatchType::SnapshotOverride => "snapshot-override",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use replaykit_core_model::{ArtifactType, HostMetadata, ReplayPolicy, SpanKind, SpanStatus};
+    use replaykit_storage::InMemoryStorage;
+
+    use super::*;
+
+    fn sample_begin_run() -> BeginRun {
+        BeginRun {
+            title: "demo".into(),
+            entrypoint: "agent.main".into(),
+            adapter_name: "test".into(),
+            adapter_version: "0.1.0".into(),
+            started_at: 1,
+            git_sha: None,
+            environment_fingerprint: None,
+            host: HostMetadata {
+                os: "macos".into(),
+                arch: "arm64".into(),
+                hostname: None,
+            },
+            labels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_parent_span() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+
+        let err = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("child".into())),
+                    parent_span_id: Some(SpanId("missing".into())),
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, CollectorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_end_span_with_output_artifact_from_other_span() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+
+        let one = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("one".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::ToolCall,
+                    name: "one".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        let two = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("two".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::ToolCall,
+                    name: "two".into(),
+                    started_at: 3,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+
+        let artifact = collector
+            .add_artifact(
+                &run.run_id,
+                Some(&one.span_id),
+                ArtifactSpec {
+                    artifact_type: ArtifactType::ToolOutput,
+                    mime: "application/json".into(),
+                    sha256: "abc".into(),
+                    byte_len: 1,
+                    blob_path: "memory://artifact".into(),
+                    summary: Document::new(),
+                    redaction: Document::new(),
+                    created_at: 4,
+                },
+            )
+            .unwrap();
+
+        let err = collector
+            .end_span(
+                &run.run_id,
+                &two.span_id,
+                EndSpan {
+                    ended_at: 5,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: vec![artifact.artifact_id],
+                    snapshot_id: None,
+                    output_fingerprint: Some("v2".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, CollectorError::InvalidInput(_)));
     }
 }

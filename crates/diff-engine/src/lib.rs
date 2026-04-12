@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use replaykit_core_model::{DiffId, Document, RunDiffRecord, RunId, Value};
+use replaykit_core_model::{DiffId, Document, IdKind, RunDiffRecord, RunId, Value};
 use replaykit_storage::{Storage, StorageError};
 
 #[derive(Debug)]
@@ -18,15 +17,11 @@ impl From<StorageError> for DiffError {
 
 pub struct DiffEngine<S: Storage> {
     storage: Arc<S>,
-    ids: AtomicU64,
 }
 
 impl<S: Storage> DiffEngine<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self {
-            storage,
-            ids: AtomicU64::new(1),
-        }
+        Self { storage }
     }
 
     pub fn diff_runs(
@@ -42,6 +37,19 @@ impl<S: Storage> DiffEngine<S> {
         let source_artifacts = self.storage.list_artifacts(source_run_id)?;
         let target_artifacts = self.storage.list_artifacts(target_run_id)?;
 
+        let source_order = source_spans
+            .iter()
+            .map(|span| span.span_id.clone())
+            .collect::<Vec<_>>();
+        let source_ids = source_order
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let target_only_ids = target_spans
+            .iter()
+            .filter(|span| !source_ids.contains(&span.span_id))
+            .map(|span| span.span_id.clone())
+            .collect::<Vec<_>>();
         let source_map = source_spans
             .into_iter()
             .map(|span| (span.span_id.clone(), span))
@@ -51,28 +59,21 @@ impl<S: Storage> DiffEngine<S> {
             .map(|span| (span.span_id.clone(), span))
             .collect::<BTreeMap<_, _>>();
 
+        let ordered_span_ids = source_order
+            .into_iter()
+            .chain(target_only_ids)
+            .collect::<Vec<_>>();
+
         let mut first_divergent_span_id = None;
         let mut changed_span_count = 0usize;
 
-        for (span_id, source_span) in &source_map {
-            match target_map.get(span_id) {
-                None => {
-                    changed_span_count += 1;
-                    if first_divergent_span_id.is_none() {
-                        first_divergent_span_id = Some(span_id.clone());
-                    }
-                }
-                Some(target_span) => {
-                    let changed = source_span.status != target_span.status
-                        || source_span.output_fingerprint != target_span.output_fingerprint
-                        || source_span.input_fingerprint != target_span.input_fingerprint
-                        || source_span.error_summary != target_span.error_summary;
-                    if changed {
-                        changed_span_count += 1;
-                        if first_divergent_span_id.is_none() {
-                            first_divergent_span_id = Some(span_id.clone());
-                        }
-                    }
+        for span_id in ordered_span_ids {
+            let source_span = source_map.get(&span_id);
+            let target_span = target_map.get(&span_id);
+            if spans_differ(source_span, target_span) {
+                changed_span_count += 1;
+                if first_divergent_span_id.is_none() {
+                    first_divergent_span_id = Some(span_id);
                 }
             }
         }
@@ -96,11 +97,14 @@ impl<S: Storage> DiffEngine<S> {
             Value::Int(changed_artifact_count as i64),
         );
         if let Some(span_id) = &first_divergent_span_id {
-            summary.insert("first_divergent_span".into(), Value::Text(span_id.0.clone()));
+            summary.insert(
+                "first_divergent_span".into(),
+                Value::Text(span_id.0.clone()),
+            );
         }
 
         let diff = RunDiffRecord {
-            diff_id: DiffId(self.next_id("diff")),
+            diff_id: DiffId(self.storage.allocate_id(IdKind::Diff)?),
             source_run_id: source_run_id.clone(),
             target_run_id: target_run_id.clone(),
             first_divergent_span_id,
@@ -124,10 +128,22 @@ impl<S: Storage> DiffEngine<S> {
             .get_diff(source_run_id, target_run_id)
             .map_err(Into::into)
     }
+}
 
-    fn next_id(&self, prefix: &str) -> String {
-        let value = self.ids.fetch_add(1, Ordering::SeqCst);
-        format!("{prefix}-{value:016x}")
+fn spans_differ(
+    source_span: Option<&replaykit_core_model::SpanRecord>,
+    target_span: Option<&replaykit_core_model::SpanRecord>,
+) -> bool {
+    match (source_span, target_span) {
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (Some(source_span), Some(target_span)) => {
+            source_span.status != target_span.status
+                || source_span.output_fingerprint != target_span.output_fingerprint
+                || source_span.input_fingerprint != target_span.input_fingerprint
+                || source_span.snapshot_id != target_span.snapshot_id
+                || source_span.error_summary != target_span.error_summary
+        }
     }
 }
 
@@ -250,8 +266,66 @@ mod tests {
             .unwrap();
 
         let engine = DiffEngine::new(storage);
-        let diff = engine.diff_runs(&source.run_id, &target.run_id, 10).unwrap();
+        let diff = engine
+            .diff_runs(&source.run_id, &target.run_id, 10)
+            .unwrap();
         assert_eq!(diff.first_divergent_span_id, Some(SpanId("span-1".into())));
+        assert_eq!(diff.changed_span_count, 1);
+    }
+
+    #[test]
+    fn counts_target_only_spans_as_changed() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let source = RunRecord::new(
+            RunId("run-a".into()),
+            TraceId("trace-a".into()),
+            "a",
+            "agent.main",
+            "adapter",
+            "0.1.0",
+            1,
+        );
+        let mut target = source.clone();
+        target.run_id = RunId("run-b".into());
+        storage.insert_run(source.clone()).unwrap();
+        storage.insert_run(target.clone()).unwrap();
+
+        storage
+            .upsert_span(SpanRecord {
+                run_id: target.run_id.clone(),
+                span_id: SpanId("span-extra".into()),
+                trace_id: target.trace_id.clone(),
+                parent_span_id: None,
+                sequence_no: 1,
+                kind: SpanKind::ToolCall,
+                name: "extra".into(),
+                status: SpanStatus::Completed,
+                started_at: 1,
+                ended_at: Some(2),
+                replay_policy: ReplayPolicy::RerunnableSupported,
+                executor_kind: None,
+                executor_version: None,
+                input_artifact_ids: Vec::new(),
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                input_fingerprint: None,
+                output_fingerprint: Some("extra".into()),
+                environment_fingerprint: None,
+                attributes: BTreeMap::new(),
+                error_code: None,
+                error_summary: None,
+                cost: Default::default(),
+            })
+            .unwrap();
+
+        let engine = DiffEngine::new(storage);
+        let diff = engine
+            .diff_runs(&source.run_id, &target.run_id, 10)
+            .unwrap();
+        assert_eq!(
+            diff.first_divergent_span_id,
+            Some(SpanId("span-extra".into()))
+        );
         assert_eq!(diff.changed_span_count, 1);
     }
 }

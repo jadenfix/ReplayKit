@@ -16,7 +16,11 @@ pub struct SemanticSession<S: Storage> {
 }
 
 impl<S: Storage> SemanticSession<S> {
-    pub fn start(storage: Arc<S>, title: impl Into<String>, entrypoint: impl Into<String>) -> Result<Self, CollectorError> {
+    pub fn start(
+        storage: Arc<S>,
+        title: impl Into<String>,
+        entrypoint: impl Into<String>,
+    ) -> Result<Self, CollectorError> {
         let collector = Collector::new(storage);
         let run = collector.begin_run(BeginRun {
             title: title.into(),
