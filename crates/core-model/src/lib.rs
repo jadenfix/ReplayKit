@@ -35,20 +35,15 @@ pub struct ReplayJobId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DiffId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
+    #[default]
     Null,
     Bool(bool),
     Int(i64),
     Text(String),
     Array(Vec<Value>),
     Object(Document),
-}
-
-impl Default for Value {
-    fn default() -> Self {
-        Self::Null
-    }
 }
 
 impl From<&str> for Value {

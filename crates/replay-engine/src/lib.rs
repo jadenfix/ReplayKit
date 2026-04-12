@@ -149,7 +149,12 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
         let edges = self.storage.list_edges(&request.source_run_id)?;
         let dirty_map = compute_dirty_map(&request.fork_span_id, &spans, &edges);
         let mut dirty_spans = dirty_map.into_values().collect::<Vec<_>>();
-        dirty_spans.sort_by_key(|record| record.span_id.0.clone());
+        dirty_spans.sort_by_key(|record| {
+            span_map
+                .get(&record.span_id)
+                .map(|span| span.sequence_no)
+                .unwrap_or(u64::MAX)
+        });
 
         let dirty_ids = dirty_spans
             .iter()
@@ -205,7 +210,9 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
         target_run.started_at = now;
         target_run.ended_at = None;
         target_run.status = RunStatus::Running;
-        target_run.labels.push("branch".into());
+        if !target_run.labels.iter().any(|label| label == "branch") {
+            target_run.labels.push("branch".into());
+        }
         self.storage.insert_run(target_run.clone())?;
 
         let replay_job = ReplayJobRecord {
@@ -631,10 +638,10 @@ fn compute_dirty_map(
     queue.push_back(fork_span_id.clone());
 
     while let Some(current) = queue.pop_front() {
-        let mut propagated = false;
+        let mut data_dependents_for_current = BTreeSet::new();
         if let Some(dependents) = data_dependents.get(&current) {
             for dependent in dependents {
-                propagated = true;
+                data_dependents_for_current.insert(dependent.clone());
                 push_dirty(
                     &mut dirty,
                     &mut queue,
@@ -645,17 +652,18 @@ fn compute_dirty_map(
             }
         }
 
-        if !propagated {
-            if let Some(descendants) = children.get(&current) {
-                for child in descendants {
-                    push_dirty(
-                        &mut dirty,
-                        &mut queue,
-                        child.clone(),
-                        DirtyReason::DependencyUnknown,
-                        current.clone(),
-                    );
+        if let Some(descendants) = children.get(&current) {
+            for child in descendants {
+                if data_dependents_for_current.contains(child) {
+                    continue;
                 }
+                push_dirty(
+                    &mut dirty,
+                    &mut queue,
+                    child.clone(),
+                    DirtyReason::DependencyUnknown,
+                    current.clone(),
+                );
             }
         }
     }
@@ -700,6 +708,12 @@ fn copy_run_data<S: Storage>(
     source_edges: &[SpanEdgeRecord],
     source_events: &[replaykit_core_model::EventRecord],
 ) -> Result<(), ReplayError> {
+    for span in source_spans {
+        let mut copied = span.clone();
+        copied.run_id = target_run_id.clone();
+        storage.upsert_span(copied)?;
+    }
+
     for artifact in source_artifacts {
         let mut copied = artifact.clone();
         copied.run_id = target_run_id.clone();
@@ -722,12 +736,6 @@ fn copy_run_data<S: Storage>(
         let mut copied = event.clone();
         copied.run_id = target_run_id.clone();
         storage.insert_event(copied)?;
-    }
-
-    for span in source_spans {
-        let mut copied = span.clone();
-        copied.run_id = target_run_id.clone();
-        storage.upsert_span(copied)?;
     }
 
     Ok(())
@@ -948,6 +956,64 @@ mod tests {
         assert!(dirty_ids.contains(&"tool".into()));
         assert!(dirty_ids.contains(&"answer".into()));
         assert!(!dirty_ids.contains(&"planner".into()));
+    }
+
+    #[test]
+    fn plans_dirty_subgraph_for_unknown_children_even_when_data_edges_exist() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let run = insert_run_fixture(&storage);
+        storage
+            .upsert_span(SpanRecord {
+                run_id: run.run_id.clone(),
+                span_id: SpanId("audit".into()),
+                trace_id: run.trace_id.clone(),
+                parent_span_id: Some(SpanId("tool".into())),
+                sequence_no: 4,
+                kind: SpanKind::GuardrailCheck,
+                name: "audit".into(),
+                status: SpanStatus::Completed,
+                started_at: 4,
+                ended_at: Some(5),
+                replay_policy: ReplayPolicy::RecordOnly,
+                executor_kind: None,
+                executor_version: None,
+                input_artifact_ids: Vec::new(),
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                input_fingerprint: None,
+                output_fingerprint: Some("audit-out".into()),
+                environment_fingerprint: None,
+                attributes: BTreeMap::new(),
+                error_code: None,
+                error_summary: None,
+                cost: CostMetrics::default(),
+            })
+            .unwrap();
+        let engine = ReplayEngine::new(storage, NoopExecutorRegistry);
+
+        let plan = engine
+            .plan_fork(&BranchRequest {
+                source_run_id: run.run_id,
+                fork_span_id: SpanId("tool".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::ToolOutputOverride,
+                    target_artifact_id: Some(ArtifactId("tool-output".into())),
+                    replacement: Value::Text("patched".into()),
+                    note: None,
+                    created_at: 10,
+                },
+                created_by: None,
+            })
+            .unwrap();
+
+        let dirty_ids = plan
+            .dirty_spans
+            .into_iter()
+            .map(|record| record.span_id.0)
+            .collect::<Vec<_>>();
+        assert!(dirty_ids.contains(&"tool".into()));
+        assert!(dirty_ids.contains(&"answer".into()));
+        assert!(dirty_ids.contains(&"audit".into()));
     }
 
     #[test]

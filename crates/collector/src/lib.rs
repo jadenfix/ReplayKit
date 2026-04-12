@@ -151,6 +151,16 @@ impl<S: Storage> Collector<S> {
         if let Some(parent_span_id) = &spec.parent_span_id {
             self.ensure_span_exists(run_id, parent_span_id)?;
         }
+        for artifact_id in &spec.input_artifact_ids {
+            self.lookup_artifact(
+                run_id,
+                artifact_id,
+                format!(
+                    "input artifact {:?} was not found in run {:?}",
+                    artifact_id.0, run_id.0
+                ),
+            )?;
+        }
         let span_id = match spec.span_id {
             Some(span_id) => {
                 if self.storage.get_span(run_id, &span_id).is_ok() {
@@ -189,6 +199,13 @@ impl<S: Storage> Collector<S> {
             cost: CostMetrics::default(),
         };
         self.storage.upsert_span(span.clone())?;
+        if span.parent_span_id.is_none() {
+            let mut run = self.storage.get_run(run_id)?;
+            if run.root_span_id.is_none() {
+                run.root_span_id = Some(span.span_id.clone());
+                self.storage.update_run(run)?;
+            }
+        }
         Ok(span)
     }
 
@@ -199,6 +216,18 @@ impl<S: Storage> Collector<S> {
         update: EndSpan,
     ) -> Result<SpanRecord, CollectorError> {
         let mut span = self.storage.get_span(run_id, span_id)?;
+        if span.is_terminal() {
+            return Err(CollectorError::InvalidInput(format!(
+                "span {:?} in run {:?} has already ended",
+                span_id.0, run_id.0
+            )));
+        }
+        if update.ended_at < span.started_at {
+            return Err(CollectorError::InvalidInput(format!(
+                "span {:?} in run {:?} cannot end before it started",
+                span_id.0, run_id.0
+            )));
+        }
         for artifact_id in &update.output_artifact_ids {
             let artifact = self.lookup_artifact(
                 run_id,
@@ -340,9 +369,22 @@ impl<S: Storage> Collector<S> {
         final_output_preview: Option<String>,
     ) -> Result<RunRecord, CollectorError> {
         let mut run = self.storage.get_run(run_id)?;
+        if ended_at < run.started_at {
+            return Err(CollectorError::InvalidInput(format!(
+                "run {:?} cannot end before it started",
+                run_id.0
+            )));
+        }
+        let spans = self.storage.list_spans(run_id)?;
+        if spans.iter().any(|span| !span.is_terminal()) {
+            return Err(CollectorError::InvalidInput(format!(
+                "run {:?} cannot finish while spans are still running",
+                run_id.0
+            )));
+        }
         run.ended_at = Some(ended_at);
         run.status = status;
-        run.summary.span_count = self.storage.list_spans(run_id)?.len() as u64;
+        run.summary.span_count = spans.len() as u64;
         run.summary.artifact_count = self.storage.list_artifacts(run_id)?.len() as u64;
         run.summary.final_output_preview = final_output_preview;
         self.storage.update_run(run.clone())?;
@@ -525,7 +567,9 @@ pub fn patch_type_label(value: PatchType) -> &'static str {
 mod tests {
     use std::sync::Arc;
 
-    use replaykit_core_model::{ArtifactType, HostMetadata, ReplayPolicy, SpanKind, SpanStatus};
+    use replaykit_core_model::{
+        ArtifactId, ArtifactType, HostMetadata, ReplayPolicy, RunStatus, SpanKind, SpanStatus,
+    };
     use replaykit_storage::InMemoryStorage;
 
     use super::*;
@@ -657,6 +701,132 @@ mod tests {
                     cost: CostMetrics::default(),
                 },
             )
+            .unwrap_err();
+
+        assert!(matches!(err, CollectorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_missing_input_artifact_on_start_span() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+
+        let err = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("tool".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: vec![ArtifactId("missing".into())],
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, CollectorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_ending_span_twice() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+        let span = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("tool".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+
+        collector
+            .end_span(
+                &run.run_id,
+                &span.span_id,
+                EndSpan {
+                    ended_at: 3,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: Vec::new(),
+                    snapshot_id: None,
+                    output_fingerprint: Some("done".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap();
+
+        let err = collector
+            .end_span(
+                &run.run_id,
+                &span.span_id,
+                EndSpan {
+                    ended_at: 4,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: Vec::new(),
+                    snapshot_id: None,
+                    output_fingerprint: Some("done-again".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics::default(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, CollectorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_finishing_run_with_running_spans() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+        collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("tool".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+
+        let err = collector
+            .finish_run(&run.run_id, 3, RunStatus::Completed, None)
             .unwrap_err();
 
         assert!(matches!(err, CollectorError::InvalidInput(_)));

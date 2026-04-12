@@ -209,7 +209,10 @@ fn build_tree(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use replaykit_collector::{ArtifactSpec, BeginRun, EndSpan, SpanSpec};
     use replaykit_core_model::{
@@ -217,7 +220,7 @@ mod tests {
         ReplayPolicy, RunStatus, SpanId, SpanKind, SpanStatus, Value,
     };
     use replaykit_replay_engine::{ExecutionResult, ProducedArtifact, ReplayExecutionContext};
-    use replaykit_storage::InMemoryStorage;
+    use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage};
 
     use super::*;
 
@@ -311,7 +314,50 @@ mod tests {
         assert_ne!(first_run.trace_id, second_run.trace_id);
     }
 
-    fn seed_run(service: &ReplayKitService<InMemoryStorage, FakeExecutorRegistry>) -> RunRecord {
+    #[test]
+    fn sqlite_branch_keeps_source_artifacts_intact() {
+        let db_path = unique_db_path("api-branch");
+        let storage = Arc::new(SqliteStorage::open(&db_path).unwrap());
+        let service = ReplayKitService::new(storage.clone(), FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let source_artifacts = storage.list_artifacts(&run.run_id).unwrap();
+
+        let execution = service
+            .create_branch(BranchRequest {
+                source_run_id: run.run_id.clone(),
+                fork_span_id: SpanId("tool".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::ToolOutputOverride,
+                    target_artifact_id: None,
+                    replacement: Value::Text("patched tool result".into()),
+                    note: None,
+                    created_at: 20,
+                },
+                created_by: Some("test".into()),
+            })
+            .unwrap();
+
+        for artifact in &source_artifacts {
+            assert_eq!(
+                storage
+                    .get_artifact(&run.run_id, &artifact.artifact_id)
+                    .unwrap()
+                    .run_id,
+                run.run_id
+            );
+            assert_eq!(
+                storage
+                    .get_artifact(&execution.target_run.run_id, &artifact.artifact_id)
+                    .unwrap()
+                    .run_id,
+                execution.target_run.run_id
+            );
+        }
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    fn seed_run<S: Storage>(service: &ReplayKitService<S, FakeExecutorRegistry>) -> RunRecord {
         let run = service.begin_run(sample_begin_run("demo")).unwrap();
 
         let planner = service
@@ -497,5 +543,13 @@ mod tests {
             summary.insert((*key).into(), Value::Text((*value).into()));
         }
         summary
+    }
+
+    fn unique_db_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("replaykit-{label}-{nonce}.db"))
     }
 }
