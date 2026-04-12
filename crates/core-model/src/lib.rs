@@ -1,39 +1,41 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 pub type Document = BTreeMap<String, Value>;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RunId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TraceId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SpanId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ArtifactId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SnapshotId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EdgeId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BranchId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ReplayJobId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DiffId(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -86,7 +88,7 @@ impl fmt::Display for Value {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanKind {
     Run,
     PlannerStep,
@@ -104,7 +106,7 @@ pub enum SpanKind {
     AdapterInternal,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EdgeKind {
     ControlParent,
     DataDependsOn,
@@ -116,7 +118,7 @@ pub enum EdgeKind {
     WritesArtifact,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayPolicy {
     RecordOnly,
     RerunnableSupported,
@@ -124,7 +126,7 @@ pub enum ReplayPolicy {
     PureReusable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     Running,
     Completed,
@@ -135,7 +137,7 @@ pub enum RunStatus {
     Imported,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanStatus {
     Running,
     Completed,
@@ -145,7 +147,7 @@ pub enum SpanStatus {
     Canceled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PatchType {
     PromptEdit,
     ToolOutputOverride,
@@ -155,13 +157,13 @@ pub enum PatchType {
     SnapshotOverride,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayMode {
     Recorded,
     Forked,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplayJobStatus {
     Queued,
     Validating,
@@ -172,7 +174,7 @@ pub enum ReplayJobStatus {
     Canceled,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirtyReason {
     PatchedInput,
     FingerprintChanged,
@@ -183,7 +185,7 @@ pub enum DirtyReason {
     DependencyUnknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureClass {
     ModelFailure,
     ToolFailure,
@@ -198,7 +200,7 @@ pub enum FailureClass {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArtifactType {
     Prompt,
     ModelRequest,
@@ -219,7 +221,7 @@ pub enum ArtifactType {
     PatchManifest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum IdKind {
     Run,
     Trace,
@@ -233,21 +235,21 @@ pub enum IdKind {
     Diff,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostMetadata {
     pub os: String,
     pub arch: String,
     pub hostname: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostMetrics {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated_cost_micros: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSummary {
     pub span_count: u64,
     pub artifact_count: u64,
@@ -258,7 +260,7 @@ pub struct RunSummary {
     pub failure_class: Option<FailureClass>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: RunId,
     pub trace_id: TraceId,
@@ -279,7 +281,7 @@ pub struct RunRecord {
     pub summary: RunSummary,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanRecord {
     pub run_id: RunId,
     pub span_id: SpanId,
@@ -306,7 +308,7 @@ pub struct SpanRecord {
     pub cost: CostMetrics,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventRecord {
     pub event_id: EventId,
     pub run_id: RunId,
@@ -317,7 +319,7 @@ pub struct EventRecord {
     pub payload: Document,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRecord {
     pub artifact_id: ArtifactId,
     pub run_id: RunId,
@@ -332,7 +334,7 @@ pub struct ArtifactRecord {
     pub created_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub snapshot_id: SnapshotId,
     pub run_id: RunId,
@@ -343,7 +345,7 @@ pub struct SnapshotRecord {
     pub created_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpanEdgeRecord {
     pub edge_id: EdgeId,
     pub run_id: RunId,
@@ -353,7 +355,7 @@ pub struct SpanEdgeRecord {
     pub attributes: Document,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PatchManifest {
     pub patch_type: PatchType,
     pub target_artifact_id: Option<ArtifactId>,
@@ -362,7 +364,7 @@ pub struct PatchManifest {
     pub created_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRecord {
     pub branch_id: BranchId,
     pub source_run_id: RunId,
@@ -374,7 +376,7 @@ pub struct BranchRecord {
     pub status: RunStatus,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayJobRecord {
     pub replay_job_id: ReplayJobId,
     pub source_run_id: RunId,
@@ -388,14 +390,14 @@ pub struct ReplayJobRecord {
     pub error_summary: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtySpanRecord {
     pub span_id: SpanId,
     pub reasons: Vec<DirtyReason>,
     pub triggered_by: Vec<SpanId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDiffRecord {
     pub diff_id: DiffId,
     pub source_run_id: RunId,
@@ -409,7 +411,7 @@ pub struct RunDiffRecord {
     pub created_at: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchRequest {
     pub source_run_id: RunId,
     pub fork_span_id: SpanId,
@@ -417,7 +419,7 @@ pub struct BranchRequest {
     pub created_by: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchPlan {
     pub source_run_id: RunId,
     pub fork_span_id: SpanId,
@@ -426,7 +428,7 @@ pub struct BranchPlan {
     pub reusable_spans: Vec<SpanId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunTreeNode {
     pub span: SpanRecord,
     pub children: Vec<RunTreeNode>,

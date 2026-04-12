@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use replaykit_core_model::{
@@ -7,6 +9,9 @@ use replaykit_core_model::{
     ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId, RunRecord, SnapshotId, SnapshotRecord,
     SpanEdgeRecord, SpanId, SpanRecord,
 };
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -445,6 +450,632 @@ impl Storage for InMemoryStorage {
     }
 }
 
+const SQLITE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS id_counters (
+    kind TEXT PRIMARY KEY,
+    counter INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_sequences (
+    run_id TEXT PRIMARY KEY,
+    next_sequence INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    started_at INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS spans (
+    run_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, span_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_spans_run_sequence ON spans(run_id, sequence_no);
+
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_run_sequence ON events(run_id, sequence_no);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_run_created ON artifacts(run_id, created_at, artifact_id);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_run_created ON snapshots(run_id, created_at, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS edges (
+    edge_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_run ON edges(run_id);
+
+CREATE TABLE IF NOT EXISTS branches (
+    branch_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replay_jobs (
+    replay_job_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS diffs (
+    source_run_id TEXT NOT NULL,
+    target_run_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (source_run_id, target_run_id)
+);
+"#;
+
+#[derive(Clone, Debug)]
+pub struct SqliteStorage {
+    db_path: Arc<PathBuf>,
+}
+
+impl SqliteStorage {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let db_path = path.into();
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                StorageError::Internal(format!(
+                    "failed to create sqlite storage directory {:?}: {err}",
+                    parent
+                ))
+            })?;
+        }
+
+        let storage = Self {
+            db_path: Arc::new(db_path),
+        };
+        storage.with_connection(|conn| {
+            conn.execute_batch(SQLITE_SCHEMA)
+                .map_err(map_sqlite_error)?;
+            Ok(())
+        })?;
+        Ok(storage)
+    }
+
+    pub fn db_path(&self) -> &Path {
+        self.db_path.as_ref()
+    }
+
+    fn with_connection<T>(
+        &self,
+        op: impl FnOnce(&Connection) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let conn = Connection::open(self.db_path.as_ref()).map_err(map_sqlite_error)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(map_sqlite_error)?;
+        op(&conn)
+    }
+
+    fn with_transaction<T>(
+        &self,
+        op: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut conn = Connection::open(self.db_path.as_ref()).map_err(map_sqlite_error)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(map_sqlite_error)?;
+        let tx = conn.transaction().map_err(map_sqlite_error)?;
+        let value = op(&tx)?;
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(value)
+    }
+}
+
+impl Storage for SqliteStorage {
+    fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError> {
+        let kind_name = kind.prefix().to_owned();
+        self.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO id_counters(kind, counter) VALUES (?1, 0)
+                 ON CONFLICT(kind) DO NOTHING",
+                params![kind_name],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "UPDATE id_counters SET counter = counter + 1 WHERE kind = ?1",
+                params![kind_name],
+            )
+            .map_err(map_sqlite_error)?;
+            let counter: u64 = tx
+                .query_row(
+                    "SELECT counter FROM id_counters WHERE kind = ?1",
+                    params![kind_name],
+                    |row| row.get(0),
+                )
+                .map_err(map_sqlite_error)?;
+            Ok(format!("{}-{counter:016x}", kind.prefix()))
+        })
+    }
+
+    fn next_sequence(&self, run_id: &RunId) -> Result<u64, StorageError> {
+        self.with_transaction(|tx| {
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM run_sequences WHERE run_id = ?1",
+                    params![run_id.0],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?;
+            if exists.is_none() {
+                return Err(StorageError::NotFound(format!(
+                    "run {:?} not found",
+                    run_id.0
+                )));
+            }
+
+            tx.execute(
+                "UPDATE run_sequences SET next_sequence = next_sequence + 1 WHERE run_id = ?1",
+                params![run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.query_row(
+                "SELECT next_sequence FROM run_sequences WHERE run_id = ?1",
+                params![run_id.0],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)
+        })
+    }
+
+    fn insert_run(&self, run: RunRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&run)?;
+        self.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO runs(run_id, started_at, payload_json) VALUES (?1, ?2, ?3)",
+                params![run.run_id.0, run.started_at, payload],
+            )
+            .map_err(map_constraint_or_sqlite_error)?;
+            tx.execute(
+                "INSERT INTO run_sequences(run_id, next_sequence) VALUES (?1, 0)",
+                params![run.run_id.0],
+            )
+            .map_err(map_constraint_or_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn update_run(&self, run: RunRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&run)?;
+        self.with_connection(|conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE runs SET started_at = ?2, payload_json = ?3 WHERE run_id = ?1",
+                    params![run.run_id.0, run.started_at, payload],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated == 0 {
+                return Err(StorageError::NotFound(format!(
+                    "run {:?} not found",
+                    run.run_id.0
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn get_run(&self, run_id: &RunId) -> Result<RunRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM runs WHERE run_id = ?1",
+                    params![run_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| StorageError::NotFound(format!("run {:?} not found", run_id.0)))?;
+            decode_json(&payload)
+        })
+    }
+
+    fn list_runs(&self) -> Result<Vec<RunRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT payload_json FROM runs ORDER BY started_at ASC, run_id ASC")
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn upsert_span(&self, span: SpanRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&span)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO spans(run_id, span_id, sequence_no, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(run_id, span_id) DO UPDATE
+                 SET sequence_no = excluded.sequence_no, payload_json = excluded.payload_json",
+                params![span.run_id.0, span.span_id.0, span.sequence_no, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn get_span(&self, run_id: &RunId, span_id: &SpanId) -> Result<SpanRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM spans WHERE run_id = ?1 AND span_id = ?2",
+                    params![run_id.0, span_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!(
+                        "span {:?} for run {:?} not found",
+                        span_id.0, run_id.0
+                    ))
+                })?;
+            decode_json(&payload)
+        })
+    }
+
+    fn list_spans(&self, run_id: &RunId) -> Result<Vec<SpanRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM spans
+                     WHERE run_id = ?1
+                     ORDER BY sequence_no ASC, span_id ASC",
+                )
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params![run_id.0], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn insert_event(&self, event: EventRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&event)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO events(event_id, run_id, sequence_no, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![event.event_id.0, event.run_id.0, event.sequence_no, payload],
+            )
+            .map_err(map_constraint_or_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn list_events(&self, run_id: &RunId) -> Result<Vec<EventRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM events
+                     WHERE run_id = ?1
+                     ORDER BY sequence_no ASC, event_id ASC",
+                )
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params![run_id.0], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn insert_artifact(&self, artifact: ArtifactRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&artifact)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO artifacts(artifact_id, run_id, created_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(artifact_id) DO UPDATE
+                 SET run_id = excluded.run_id, created_at = excluded.created_at, payload_json = excluded.payload_json",
+                params![artifact.artifact_id.0, artifact.run_id.0, artifact.created_at, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn get_artifact(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<ArtifactRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM artifacts WHERE run_id = ?1 AND artifact_id = ?2",
+                    params![run_id.0, artifact_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!(
+                        "artifact {:?} for run {:?} not found",
+                        artifact_id.0, run_id.0
+                    ))
+                })?;
+            decode_json(&payload)
+        })
+    }
+
+    fn list_artifacts(&self, run_id: &RunId) -> Result<Vec<ArtifactRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM artifacts
+                     WHERE run_id = ?1
+                     ORDER BY created_at ASC, artifact_id ASC",
+                )
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params![run_id.0], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn insert_snapshot(&self, snapshot: SnapshotRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&snapshot)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO snapshots(snapshot_id, run_id, created_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(snapshot_id) DO UPDATE
+                 SET run_id = excluded.run_id, created_at = excluded.created_at, payload_json = excluded.payload_json",
+                params![snapshot.snapshot_id.0, snapshot.run_id.0, snapshot.created_at, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn get_snapshot(
+        &self,
+        run_id: &RunId,
+        snapshot_id: &SnapshotId,
+    ) -> Result<SnapshotRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM snapshots WHERE run_id = ?1 AND snapshot_id = ?2",
+                    params![run_id.0, snapshot_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!(
+                        "snapshot {:?} for run {:?} not found",
+                        snapshot_id.0, run_id.0
+                    ))
+                })?;
+            decode_json(&payload)
+        })
+    }
+
+    fn list_snapshots(&self, run_id: &RunId) -> Result<Vec<SnapshotRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM snapshots
+                     WHERE run_id = ?1
+                     ORDER BY created_at ASC, snapshot_id ASC",
+                )
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params![run_id.0], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn insert_edge(&self, edge: SpanEdgeRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&edge)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO edges(edge_id, run_id, payload_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(edge_id) DO UPDATE
+                 SET run_id = excluded.run_id, payload_json = excluded.payload_json",
+                params![edge.edge_id.0, edge.run_id.0, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn list_edges(&self, run_id: &RunId) -> Result<Vec<SpanEdgeRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT payload_json FROM edges WHERE run_id = ?1 ORDER BY edge_id ASC")
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map(params![run_id.0], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
+        })
+    }
+
+    fn insert_branch(&self, branch: BranchRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&branch)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO branches(branch_id, payload_json)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(branch_id) DO UPDATE SET payload_json = excluded.payload_json",
+                params![branch.branch_id.0, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn get_branch(&self, branch_id: &BranchId) -> Result<BranchRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM branches WHERE branch_id = ?1",
+                    params![branch_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!("branch {:?} not found", branch_id.0))
+                })?;
+            decode_json(&payload)
+        })
+    }
+
+    fn insert_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&job)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO replay_jobs(replay_job_id, payload_json) VALUES (?1, ?2)",
+                params![job.replay_job_id.0, payload],
+            )
+            .map_err(map_constraint_or_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn update_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&job)?;
+        self.with_connection(|conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE replay_jobs SET payload_json = ?2 WHERE replay_job_id = ?1",
+                    params![job.replay_job_id.0, payload],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated == 0 {
+                return Err(StorageError::NotFound(format!(
+                    "replay job {:?} not found",
+                    job.replay_job_id.0
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn get_replay_job(&self, replay_job_id: &ReplayJobId) -> Result<ReplayJobRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM replay_jobs WHERE replay_job_id = ?1",
+                    params![replay_job_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!("replay job {:?} not found", replay_job_id.0))
+                })?;
+            decode_json(&payload)
+        })
+    }
+
+    fn insert_diff(&self, diff: RunDiffRecord) -> Result<(), StorageError> {
+        let payload = encode_json(&diff)?;
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO diffs(source_run_id, target_run_id, payload_json)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source_run_id, target_run_id) DO UPDATE
+                 SET payload_json = excluded.payload_json",
+                params![diff.source_run_id.0, diff.target_run_id.0, payload],
+            )
+            .map_err(map_sqlite_error)?;
+            Ok(())
+        })
+    }
+
+    fn get_diff(&self, source: &RunId, target: &RunId) -> Result<RunDiffRecord, StorageError> {
+        self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM diffs WHERE source_run_id = ?1 AND target_run_id = ?2",
+                    params![source.0, target.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!(
+                        "diff for runs {:?} -> {:?} not found",
+                        source.0, target.0
+                    ))
+                })?;
+            decode_json(&payload)
+        })
+    }
+}
+
+fn encode_json<T: Serialize>(value: &T) -> Result<String, StorageError> {
+    serde_json::to_string(value).map_err(|err| {
+        StorageError::Internal(format!("failed to serialize storage payload: {err}"))
+    })
+}
+
+fn decode_json<T: DeserializeOwned>(payload: &str) -> Result<T, StorageError> {
+    serde_json::from_str(payload).map_err(|err| {
+        StorageError::Internal(format!("failed to deserialize storage payload: {err}"))
+    })
+}
+
+fn collect_json_rows<T: DeserializeOwned>(
+    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<String>>,
+) -> Result<Vec<T>, StorageError> {
+    let mut values = Vec::new();
+    for row in rows {
+        let payload = row.map_err(map_sqlite_error)?;
+        values.push(decode_json(&payload)?);
+    }
+    Ok(values)
+}
+
+fn map_constraint_or_sqlite_error(error: rusqlite::Error) -> StorageError {
+    match &error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == 1555 || code.extended_code == 2067 =>
+        {
+            StorageError::Conflict(error.to_string())
+        }
+        _ => map_sqlite_error(error),
+    }
+}
+
+fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
+    StorageError::Internal(format!("sqlite error: {error}"))
+}
+
 pub fn root_spans(spans: &[SpanRecord]) -> Vec<SpanRecord> {
     let known_span_ids = spans
         .iter()
@@ -463,6 +1094,9 @@ pub fn root_spans(spans: &[SpanRecord]) -> Vec<SpanRecord> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use replaykit_core_model::{
         HostMetadata, ReplayPolicy, RunRecord, RunStatus, SpanKind, SpanRecord, SpanStatus, TraceId,
     };
@@ -542,5 +1176,68 @@ mod tests {
         assert!(first_run.starts_with("run-"));
         assert!(second_run.starts_with("run-"));
         assert!(first_span.starts_with("span-"));
+    }
+
+    #[test]
+    fn sqlite_storage_round_trips_and_persists_across_reopen() {
+        let db_path = unique_db_path("round-trip");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let span = SpanRecord {
+            run_id: run.run_id.clone(),
+            span_id: SpanId("span-sqlite".into()),
+            trace_id: run.trace_id.clone(),
+            parent_span_id: None,
+            sequence_no: storage.next_sequence(&run.run_id).unwrap(),
+            kind: SpanKind::Run,
+            name: "root".into(),
+            status: SpanStatus::Completed,
+            started_at: 1,
+            ended_at: Some(2),
+            replay_policy: ReplayPolicy::RecordOnly,
+            executor_kind: None,
+            executor_version: None,
+            input_artifact_ids: Vec::new(),
+            output_artifact_ids: Vec::new(),
+            snapshot_id: None,
+            input_fingerprint: None,
+            output_fingerprint: Some("sqlite-span".into()),
+            environment_fingerprint: None,
+            attributes: BTreeMap::new(),
+            error_code: None,
+            error_summary: None,
+            cost: Default::default(),
+        };
+        storage.upsert_span(span.clone()).unwrap();
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(reopened.get_run(&run.run_id).unwrap().title, "demo");
+        assert_eq!(
+            reopened
+                .get_span(&run.run_id, &span.span_id)
+                .unwrap()
+                .output_fingerprint,
+            Some("sqlite-span".into())
+        );
+        assert_eq!(
+            reopened.allocate_id(IdKind::Run).unwrap(),
+            "run-0000000000000001"
+        );
+        assert_eq!(
+            reopened.allocate_id(IdKind::Run).unwrap(),
+            "run-0000000000000002"
+        );
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    fn unique_db_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("replaykit-{label}-{nonce}.db"))
     }
 }

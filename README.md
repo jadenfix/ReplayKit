@@ -25,3 +25,35 @@ ReplayKit should let a user:
 
 The product is not trying to replace workflow orchestration systems or deterministic process replay systems.
 It is trying to become the best local debugger for agent behavior.
+
+## Current Runtime
+
+The repo now has two storage backends:
+
+- `InMemoryStorage` for fast tests and demos
+- `SqliteStorage` for durable local metadata persistence
+
+The CLI chooses the backend through environment variables:
+
+- `REPLAYKIT_STORAGE=memory` uses the in-memory backend
+- `REPLAYKIT_STORAGE=sqlite` uses SQLite
+- `REPLAYKIT_DB_PATH=/path/to/replaykit.db` sets the SQLite file location
+
+Example:
+
+```bash
+REPLAYKIT_STORAGE=sqlite \
+REPLAYKIT_DB_PATH=./data/replaykit.db \
+cargo run -p replaykit-cli -- demo-branch
+```
+
+## Docker
+
+The first Dockerized persistence setup uses SQLite on a Docker volume rather than a networked database.
+That keeps the backend aligned with the local-first architecture while giving the project a real durable store.
+
+Run the demo against the Docker volume:
+
+```bash
+docker compose run --rm replaykit
+```

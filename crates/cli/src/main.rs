@@ -6,15 +6,30 @@ use replaykit_core_model::{
 };
 use replaykit_replay_engine::NoopExecutorRegistry;
 use replaykit_sdk_rust_tracing::{CompletedSpanSpec, SemanticSession, summary_from_pairs};
-use replaykit_storage::InMemoryStorage;
+use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage};
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
     let command = args.get(1).map(String::as_str).unwrap_or("demo");
+    let storage_kind = std::env::var("REPLAYKIT_STORAGE").unwrap_or_else(|_| "memory".into());
 
-    let storage = Arc::new(InMemoryStorage::new());
+    match storage_kind.as_str() {
+        "memory" => run_command(command, Arc::new(InMemoryStorage::new())),
+        "sqlite" => {
+            let db_path = std::env::var("REPLAYKIT_DB_PATH")
+                .unwrap_or_else(|_| "data/replaykit/replaykit.db".into());
+            let storage = SqliteStorage::open(db_path).expect("open sqlite storage");
+            run_command(command, Arc::new(storage));
+        }
+        other => {
+            eprintln!("unsupported REPLAYKIT_STORAGE value: {other}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_command<S: Storage + 'static>(command: &str, storage: Arc<S>) {
     let service = ReplayKitService::new(storage.clone(), NoopExecutorRegistry);
-
     match command {
         "demo" => {
             let run_id = seed_demo_run(storage).expect("seed demo run");
@@ -65,7 +80,7 @@ fn main() {
     }
 }
 
-fn seed_demo_run(storage: Arc<InMemoryStorage>) -> Result<RunId, String> {
+fn seed_demo_run<S: Storage>(storage: Arc<S>) -> Result<RunId, String> {
     let session = SemanticSession::start(storage, "demo coding run", "agent.main")
         .map_err(|err| err.to_string())?;
     let run_id = session.run().run_id.clone();
@@ -129,7 +144,7 @@ fn seed_demo_run(storage: Arc<InMemoryStorage>) -> Result<RunId, String> {
     Ok(run_id)
 }
 
-fn print_run(service: &ReplayKitService<InMemoryStorage, NoopExecutorRegistry>, run_id: &RunId) {
+fn print_run<S: Storage>(service: &ReplayKitService<S, NoopExecutorRegistry>, run_id: &RunId) {
     let runs = service.list_runs().expect("runs");
     println!("runs: {}", runs.len());
     let trees = service.run_tree(run_id).expect("run tree");

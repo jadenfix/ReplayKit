@@ -1,0 +1,14 @@
+services:
+  replaykit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REPLAYKIT_STORAGE: sqlite
+      REPLAYKIT_DB_PATH: /data/replaykit.db
+    volumes:
+      - replaykit-data:/data
+    command: ["demo-branch"]
+
+volumes:
+  replaykit-data:
