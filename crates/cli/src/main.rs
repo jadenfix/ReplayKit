@@ -12,7 +12,7 @@ use replaykit_api::{ApiError, ReplayKitService};
 use replaykit_core_model::{
     BranchRequest, PatchManifest, PatchType, RunId, RunTreeNode, SpanId, SpanKind, Value,
 };
-use replaykit_replay_engine::NoopExecutorRegistry;
+use replaykit_replay_engine::executors::CompositeExecutorRegistry;
 use replaykit_sdk_rust_tracing::{CompletedSpanSpec, SemanticSession, summary_from_pairs};
 use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage};
 
@@ -27,13 +27,13 @@ struct Cli {
     #[arg(long, env = "REPLAYKIT_STORAGE", default_value = "memory")]
     storage: String,
 
-    /// SQLite database path (when storage=sqlite)
+    /// Data root directory (when storage=sqlite). Contains replaykit.db and blob store.
     #[arg(
         long,
-        env = "REPLAYKIT_DB_PATH",
-        default_value = "data/replaykit/replaykit.db"
+        env = "REPLAYKIT_DATA_ROOT",
+        default_value = "data/replaykit"
     )]
-    db_path: String,
+    data_root: String,
 
     /// Output as JSON instead of human-readable text
     #[arg(long, global = true)]
@@ -175,10 +175,10 @@ fn main() {
     match cli.storage.as_str() {
         "memory" => dispatch(cli, Arc::new(InMemoryStorage::new())),
         "sqlite" => {
-            let storage = match SqliteStorage::open(&cli.db_path) {
+            let storage = match SqliteStorage::open_with_data_root(&cli.data_root) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("error: failed to open sqlite at {}: {e}", cli.db_path);
+                    eprintln!("error: failed to open sqlite at {}: {e}", cli.data_root);
                     process::exit(2);
                 }
             };
@@ -192,7 +192,7 @@ fn main() {
 }
 
 fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
-    let service = Arc::new(ReplayKitService::new(storage.clone(), NoopExecutorRegistry));
+    let service = Arc::new(ReplayKitService::new(storage.clone(), CompositeExecutorRegistry::new()));
     let json = cli.json;
 
     match cli.command {
@@ -858,7 +858,7 @@ mod tests {
     fn demo_run_seeds_and_has_expected_structure() {
         let storage = Arc::new(InMemoryStorage::new());
         let run_id = seed_demo_run(storage.clone()).unwrap();
-        let service = ReplayKitService::new(storage, NoopExecutorRegistry);
+        let service = ReplayKitService::new(storage, CompositeExecutorRegistry::new());
         let tree = service.run_tree(&run_id).unwrap();
         assert_eq!(tree.len(), 1); // one root: planner
         assert_eq!(tree[0].children.len(), 2); // tool + answer

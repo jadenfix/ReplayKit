@@ -35,6 +35,7 @@ impl ExecutorRegistry for FakeExecutorRegistry {
                 sha256: "replayed".into(),
                 byte_len: 1,
                 blob_path: "memory://replayed".into(),
+                content: None,
                 summary: Document::new(),
                 redaction: Document::new(),
                 created_at: 10,
@@ -301,7 +302,9 @@ async fn run_tree_returns_200_with_nodes() {
 #[tokio::test]
 async fn run_edges_returns_200() {
     let (server, run_id) = seeded_server();
-    let resp = server.get(&format!("/api/v1/runs/{}/edges", run_id.0)).await;
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/edges", run_id.0))
+        .await;
     resp.assert_status_ok();
     let body: serde_json::Value = resp.json();
     assert!(body.is_array());

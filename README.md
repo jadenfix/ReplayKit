@@ -37,13 +37,13 @@ The CLI chooses the backend through environment variables:
 
 - `REPLAYKIT_STORAGE=memory` uses the in-memory backend
 - `REPLAYKIT_STORAGE=sqlite` uses SQLite
-- `REPLAYKIT_DB_PATH=/path/to/replaykit.db` sets the SQLite file location
+- `REPLAYKIT_DATA_ROOT=/path/to/data` sets the data directory (contains `replaykit.db` and the blob store)
 
 Example:
 
 ```bash
 REPLAYKIT_STORAGE=sqlite \
-REPLAYKIT_DB_PATH=./data/replaykit.db \
+REPLAYKIT_DATA_ROOT=./data/replaykit \
 cargo run -p replaykit-cli -- demo-branch
 ```
 
