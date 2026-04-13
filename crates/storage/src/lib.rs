@@ -9,9 +9,9 @@ use std::thread;
 use std::time::Duration;
 
 use replaykit_core_model::{
-    ArtifactId, ArtifactRecord, BranchId, BranchRecord, DirtySpanRecord, EventRecord, IdKind,
-    ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId, RunRecord, RunStatus, SnapshotId,
-    SnapshotRecord, SpanEdgeRecord, SpanId, SpanRecord,
+    ArtifactId, ArtifactRecord, BranchId, BranchRecord, EventRecord, IdKind, ReplayJobId,
+    ReplayJobRecord, RunDiffRecord, RunId, RunRecord, RunStatus, SnapshotId, SnapshotRecord,
+    SpanEdgeRecord, SpanId, SpanRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -106,11 +106,6 @@ pub trait Storage: Send + Sync {
         run_id: &RunId,
         artifact_id: &ArtifactId,
     ) -> Result<BlobIntegrity, StorageError>;
-
-    fn dirty_spans_for_run(&self, run_id: &RunId) -> Result<Vec<DirtySpanRecord>, StorageError> {
-        let _ = run_id;
-        Ok(Vec::new())
-    }
 }
 
 /// Report produced by an integrity scan for a single artifact.
@@ -798,6 +793,8 @@ CREATE TABLE IF NOT EXISTS runs (
     payload_json TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at, run_id);
+
 CREATE TABLE IF NOT EXISTS spans (
     run_id TEXT NOT NULL,
     span_id TEXT NOT NULL,
@@ -1301,8 +1298,8 @@ impl Storage for SqliteStorage {
 
     fn update_run(&self, run: RunRecord) -> Result<(), StorageError> {
         let payload = encode_json(&run)?;
-        self.with_connection(|conn| {
-            let updated = conn
+        self.with_transaction(|tx| {
+            let updated = tx
                 .execute(
                     "UPDATE runs SET started_at = ?2, payload_json = ?3 WHERE run_id = ?1",
                     params![run.run_id.0, run.started_at, payload],
@@ -1347,8 +1344,8 @@ impl Storage for SqliteStorage {
 
     fn upsert_span(&self, span: SpanRecord) -> Result<(), StorageError> {
         let payload = encode_json(&span)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &span.run_id)?;
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &span.run_id)?;
             if let Some(parent_span_id) = &span.parent_span_id {
                 if *parent_span_id == span.span_id {
                     return Err(StorageError::InvalidInput(format!(
@@ -1356,9 +1353,9 @@ impl Storage for SqliteStorage {
                         span.span_id.0
                     )));
                 }
-                Self::ensure_span_exists_conn(conn, &span.run_id, parent_span_id)?;
+                Self::ensure_span_exists_conn(tx, &span.run_id, parent_span_id)?;
             }
-            conn.execute(
+            tx.execute(
                 "INSERT INTO spans(run_id, span_id, sequence_no, payload_json)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(run_id, span_id) DO UPDATE
@@ -1408,10 +1405,10 @@ impl Storage for SqliteStorage {
 
     fn insert_event(&self, event: EventRecord) -> Result<(), StorageError> {
         let payload = encode_json(&event)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &event.run_id)?;
-            Self::ensure_span_exists_conn(conn, &event.run_id, &event.span_id)?;
-            conn.execute(
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &event.run_id)?;
+            Self::ensure_span_exists_conn(tx, &event.run_id, &event.span_id)?;
+            tx.execute(
                 "INSERT INTO events(run_id, event_id, sequence_no, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![event.run_id.0, event.event_id.0, event.sequence_no, payload],
@@ -1439,13 +1436,13 @@ impl Storage for SqliteStorage {
 
     fn insert_artifact(&self, artifact: ArtifactRecord) -> Result<(), StorageError> {
         let payload = encode_json(&artifact)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &artifact.run_id)?;
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &artifact.run_id)?;
             if let Some(span_id) = &artifact.span_id {
-                Self::ensure_span_exists_conn(conn, &artifact.run_id, span_id)?;
+                Self::ensure_span_exists_conn(tx, &artifact.run_id, span_id)?;
             }
             validate_artifact_record(&artifact)?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO artifacts(run_id, artifact_id, created_at, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -1508,12 +1505,12 @@ impl Storage for SqliteStorage {
 
     fn insert_snapshot(&self, snapshot: SnapshotRecord) -> Result<(), StorageError> {
         let payload = encode_json(&snapshot)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &snapshot.run_id)?;
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &snapshot.run_id)?;
             if let Some(span_id) = &snapshot.span_id {
-                Self::ensure_span_exists_conn(conn, &snapshot.run_id, span_id)?;
+                Self::ensure_span_exists_conn(tx, &snapshot.run_id, span_id)?;
             }
-            let artifact = Self::get_artifact_conn(conn, &snapshot.run_id, &snapshot.artifact_id)?;
+            let artifact = Self::get_artifact_conn(tx, &snapshot.run_id, &snapshot.artifact_id)?;
             if let Some(span_id) = &snapshot.span_id {
                 match artifact.span_id {
                     Some(ref artifact_span_id) if artifact_span_id == span_id => {}
@@ -1531,7 +1528,7 @@ impl Storage for SqliteStorage {
                     }
                 }
             }
-            conn.execute(
+            tx.execute(
                 "INSERT INTO snapshots(run_id, snapshot_id, created_at, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -1588,11 +1585,11 @@ impl Storage for SqliteStorage {
 
     fn insert_edge(&self, edge: SpanEdgeRecord) -> Result<(), StorageError> {
         let payload = encode_json(&edge)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &edge.run_id)?;
-            Self::ensure_span_exists_conn(conn, &edge.run_id, &edge.from_span_id)?;
-            Self::ensure_span_exists_conn(conn, &edge.run_id, &edge.to_span_id)?;
-            conn.execute(
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &edge.run_id)?;
+            Self::ensure_span_exists_conn(tx, &edge.run_id, &edge.from_span_id)?;
+            Self::ensure_span_exists_conn(tx, &edge.run_id, &edge.to_span_id)?;
+            tx.execute(
                 "INSERT INTO edges(run_id, edge_id, payload_json)
                  VALUES (?1, ?2, ?3)",
                 params![edge.run_id.0, edge.edge_id.0, payload],
@@ -1683,12 +1680,12 @@ impl Storage for SqliteStorage {
 
     fn update_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
         let payload = encode_json(&job)?;
-        self.with_connection(|conn| {
-            Self::ensure_run_exists_conn(conn, &job.source_run_id)?;
+        self.with_transaction(|tx| {
+            Self::ensure_run_exists_conn(tx, &job.source_run_id)?;
             if let Some(target_run_id) = &job.target_run_id {
-                Self::ensure_run_exists_conn(conn, target_run_id)?;
+                Self::ensure_run_exists_conn(tx, target_run_id)?;
             }
-            let updated = conn
+            let updated = tx
                 .execute(
                     "UPDATE replay_jobs SET payload_json = ?2 WHERE replay_job_id = ?1",
                     params![job.replay_job_id.0, payload],
@@ -1841,9 +1838,9 @@ impl SqliteStorage {
     /// Mark all runs with status == Running as Interrupted.
     /// Returns the list of affected run IDs.
     pub fn recover_interrupted_runs(&self) -> Result<Vec<RunId>, StorageError> {
-        self.with_connection(|conn| {
+        self.with_transaction(|tx| {
             // Find all runs currently in Running state.
-            let mut stmt = conn
+            let mut stmt = tx
                 .prepare("SELECT payload_json FROM runs")
                 .map_err(map_sqlite_error)?;
             let rows = stmt
@@ -1859,7 +1856,7 @@ impl SqliteStorage {
                     let mut updated = run;
                     updated.status = RunStatus::Interrupted;
                     let new_payload = encode_json(&updated)?;
-                    conn.execute(
+                    tx.execute(
                         "UPDATE runs SET payload_json = ?2 WHERE run_id = ?1",
                         params![updated.run_id.0, new_payload],
                     )
