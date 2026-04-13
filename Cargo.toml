@@ -9,6 +9,7 @@ members = [
     "crates/sdk-rust-tracing",
     "crates/cli",
     "examples/coding-agent",
+    "fixtures/golden-runs",
 ]
 resolver = "2"
 

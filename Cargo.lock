@@ -1323,6 +1323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "replaykit-fixtures"
+version = "0.1.0"
+dependencies = [
+ "replaykit-core-model",
+ "replaykit-sdk-rust-tracing",
+ "replaykit-storage",
+]
+
+[[package]]
 name = "replaykit-replay-engine"
 version = "0.1.0"
 dependencies = [
@@ -1337,6 +1346,8 @@ dependencies = [
  "replaykit-collector",
  "replaykit-core-model",
  "replaykit-storage",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
