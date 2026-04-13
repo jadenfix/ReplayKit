@@ -455,6 +455,62 @@ mod tests {
     // -- Layer integration -------------------------------------------------
 
     #[test]
+    fn typed_helpers_populate_attributes() {
+        let spec = helpers::shell_command("run tests")
+            .command("cargo test --test auth")
+            .cwd("/tmp/project")
+            .timeout_ms(30000)
+            .build();
+        assert_eq!(
+            spec.attributes.get("command"),
+            Some(&Value::Text("cargo test --test auth".into()))
+        );
+        assert_eq!(
+            spec.attributes.get("cwd"),
+            Some(&Value::Text("/tmp/project".into()))
+        );
+        assert_eq!(spec.attributes.get("timeout_ms"), Some(&Value::Int(30000)));
+    }
+
+    #[test]
+    fn typed_helpers_compose_with_freeform_attributes() {
+        let mut custom = Document::new();
+        custom.insert("custom_key".into(), Value::Text("custom_val".into()));
+
+        let spec = helpers::file_read("read file")
+            .path("/tmp/foo.rs")
+            .attributes(custom)
+            .build();
+
+        assert_eq!(
+            spec.attributes.get("path"),
+            Some(&Value::Text("/tmp/foo.rs".into()))
+        );
+        assert_eq!(
+            spec.attributes.get("custom_key"),
+            Some(&Value::Text("custom_val".into()))
+        );
+    }
+
+    #[test]
+    fn model_call_typed_helpers() {
+        let spec = helpers::model_call("generate fix")
+            .provider("anthropic")
+            .model("claude-sonnet-4-6")
+            .model_request_json(r#"{"messages":[]}"#)
+            .build();
+        assert_eq!(
+            spec.attributes.get("provider"),
+            Some(&Value::Text("anthropic".into()))
+        );
+        assert_eq!(
+            spec.attributes.get("model"),
+            Some(&Value::Text("claude-sonnet-4-6".into()))
+        );
+        assert!(spec.attributes.contains_key("model_request_json"));
+    }
+
+    #[test]
     fn layer_captures_spans_with_rk_kind() {
         use tracing_subscriber::prelude::*;
 

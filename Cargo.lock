@@ -1327,6 +1327,7 @@ name = "replaykit-fixtures"
 version = "0.1.0"
 dependencies = [
  "replaykit-core-model",
+ "replaykit-replay-engine",
  "replaykit-sdk-rust-tracing",
  "replaykit-storage",
 ]

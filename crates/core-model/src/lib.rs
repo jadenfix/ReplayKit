@@ -70,6 +70,29 @@ impl From<i64> for Value {
     }
 }
 
+/// Well-known span attribute keys for the replay contract.
+///
+/// Both the SDK helpers and replay-engine executors reference these constants
+/// to ensure consistent attribute names across the capture and replay paths.
+pub mod attrs {
+    /// Shell command string (for `ShellCommand` spans).
+    pub const COMMAND: &str = "command";
+    /// Working directory (for `ShellCommand` spans).
+    pub const CWD: &str = "cwd";
+    /// Timeout in milliseconds (for `ShellCommand` spans).
+    pub const TIMEOUT_MS: &str = "timeout_ms";
+    /// File system path (for `FileRead` and `FileWrite` spans).
+    pub const PATH: &str = "path";
+    /// File content to write (for `FileWrite` spans).
+    pub const CONTENT: &str = "content";
+    /// Model provider name (for `LlmCall` spans).
+    pub const PROVIDER: &str = "provider";
+    /// Model identifier (for `LlmCall` spans).
+    pub const MODEL: &str = "model";
+    /// Serialized model request JSON (for `LlmCall` spans).
+    pub const MODEL_REQUEST_JSON: &str = "model_request_json";
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
