@@ -62,7 +62,8 @@ impl ShellExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_shell_contract(span) {
+        let diag = validate_shell_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let cmd_str = match span.attributes.get(attrs::COMMAND) {
@@ -183,7 +184,8 @@ impl FileReadExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_file_read_contract(span) {
+        let diag = validate_file_read_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let path = extract_file_path(span);
@@ -239,12 +241,14 @@ impl FileWriteExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_file_write_contract(span) {
+        let diag = validate_file_write_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let path = extract_file_path(span);
         let now = now_epoch_secs();
 
+        // Content is guaranteed present by validate_file_write_contract.
         let content = extract_write_content(span).ok_or_else(|| {
             ReplayError::Blocked("file write span is missing content attribute".into())
         })?;
@@ -291,7 +295,8 @@ impl BlockedModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_llm_contract(span) {
+        let diag = validate_llm_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let model = span
@@ -307,7 +312,8 @@ impl BlockedModelExecutor {
     }
 
     pub fn why_not(&self, span: &SpanRecord) -> Option<String> {
-        if let Some(reason) = validate_llm_contract(span) {
+        let diag = validate_llm_contract(span);
+        if let Some(reason) = diag.block {
             return Some(reason);
         }
         let model = span
@@ -316,9 +322,12 @@ impl BlockedModelExecutor {
             .map(|v| v.to_string())
             .or_else(|| span.executor_kind.clone())
             .unwrap_or_else(|| "unknown".into());
-        Some(format!(
-            "LlmCall to model '{model}' blocked: no live model executor configured"
-        ))
+        let mut msg =
+            format!("LlmCall to model '{model}' blocked: no live model executor configured");
+        if let Some(warnings) = diag.warnings_summary() {
+            msg.push_str(&format!(" ({})", warnings));
+        }
+        Some(msg)
     }
 }
 
@@ -350,7 +359,8 @@ impl FakeModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_llm_contract(span) {
+        let diag = validate_llm_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let response = self
@@ -393,7 +403,8 @@ impl PassthroughModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
-        if let Some(reason) = validate_llm_contract(span) {
+        let diag = validate_llm_contract(span);
+        if let Some(reason) = diag.block {
             return Err(ReplayError::Blocked(reason));
         }
         let provider = span
@@ -492,14 +503,70 @@ impl ExecutorRegistry for CompositeExecutorRegistry {
 
     fn why_not(&self, span: &SpanRecord) -> Option<String> {
         match span.kind {
-            SpanKind::ShellCommand => validate_shell_contract(span),
-            SpanKind::FileRead => validate_file_read_contract(span),
-            SpanKind::FileWrite => validate_file_write_contract(span),
-            SpanKind::LlmCall => validate_llm_contract(span).or_else(|| match &self.model_mode {
-                ModelExecutorMode::Blocked => BlockedModelExecutor.why_not(span),
-                _ => None,
-            }),
+            SpanKind::ShellCommand => {
+                let diag = validate_shell_contract(span);
+                diag.block.clone().or_else(|| diag.warnings_summary())
+            }
+            SpanKind::FileRead => {
+                let diag = validate_file_read_contract(span);
+                diag.block.clone().or_else(|| diag.warnings_summary())
+            }
+            SpanKind::FileWrite => {
+                let diag = validate_file_write_contract(span);
+                diag.block.clone().or_else(|| diag.warnings_summary())
+            }
+            SpanKind::LlmCall => {
+                let diag = validate_llm_contract(span);
+                if diag.block.is_some() {
+                    return diag.block;
+                }
+                match &self.model_mode {
+                    ModelExecutorMode::Blocked => BlockedModelExecutor.why_not(span),
+                    _ => diag.warnings_summary(),
+                }
+            }
             _ => Some(format!("no executor for span kind {:?}", span.kind)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Result of contract validation for a span kind. Separates hard blocks
+/// (span cannot be replayed at all) from warnings (replay proceeds but
+/// with degraded fidelity, e.g. falling back to span name as command).
+#[derive(Clone, Debug, Default)]
+pub struct ContractDiagnostic {
+    /// If set, replay must stop — the span is missing a required attribute.
+    pub block: Option<String>,
+    /// Non-fatal issues — replay proceeds but semantics are weaker.
+    pub warnings: Vec<String>,
+}
+
+impl ContractDiagnostic {
+    fn blocked(reason: impl Into<String>) -> Self {
+        Self {
+            block: Some(reason.into()),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn ok() -> Self {
+        Self::default()
+    }
+
+    fn warn(&mut self, msg: impl Into<String>) {
+        self.warnings.push(msg.into());
+    }
+
+    /// Format warnings into a single description for `why_not()`.
+    pub fn warnings_summary(&self) -> Option<String> {
+        if self.warnings.is_empty() {
+            None
+        } else {
+            Some(self.warnings.join("; "))
         }
     }
 }
@@ -532,40 +599,78 @@ fn extract_write_content(span: &SpanRecord) -> Option<String> {
     None
 }
 
-fn validate_shell_contract(span: &SpanRecord) -> Option<String> {
+fn validate_shell_contract(span: &SpanRecord) -> ContractDiagnostic {
     let has_command = matches!(span.attributes.get(attrs::COMMAND), Some(Value::Text(_)));
     if !has_command && span.name.is_empty() {
-        return Some("ShellCommand span has no 'command' attribute and empty name".into());
+        return ContractDiagnostic::blocked(
+            "ShellCommand span has no 'command' attribute and empty name",
+        );
     }
-    None
+    let mut diag = ContractDiagnostic::ok();
+    if !has_command {
+        diag.warn("missing 'command' attribute — falling back to span name as command");
+    }
+    if !matches!(span.attributes.get(attrs::CWD), Some(Value::Text(_))) {
+        diag.warn("missing 'cwd' attribute — shell will use process working directory");
+    }
+    diag
 }
 
-fn validate_file_read_contract(span: &SpanRecord) -> Option<String> {
+fn validate_file_read_contract(span: &SpanRecord) -> ContractDiagnostic {
     let has_path = matches!(span.attributes.get(attrs::PATH), Some(Value::Text(_)));
     if !has_path && span.name.is_empty() {
-        return Some("FileRead span has no 'path' attribute and empty name".into());
+        return ContractDiagnostic::blocked("FileRead span has no 'path' attribute and empty name");
     }
-    None
+    let mut diag = ContractDiagnostic::ok();
+    if !has_path {
+        diag.warn("missing 'path' attribute — falling back to span name as path");
+    }
+    diag
 }
 
-fn validate_file_write_contract(span: &SpanRecord) -> Option<String> {
+fn validate_file_write_contract(span: &SpanRecord) -> ContractDiagnostic {
     let has_path = matches!(span.attributes.get(attrs::PATH), Some(Value::Text(_)));
+    let has_content = matches!(span.attributes.get(attrs::CONTENT), Some(Value::Text(_)));
+
     if !has_path && span.name.is_empty() {
-        return Some("FileWrite span has no 'path' attribute and empty name".into());
+        return ContractDiagnostic::blocked(
+            "FileWrite span has no 'path' attribute and empty name",
+        );
     }
-    None
+    if !has_content {
+        return ContractDiagnostic::blocked(
+            "FileWrite span has no 'content' attribute — cannot replay without write content",
+        );
+    }
+    let mut diag = ContractDiagnostic::ok();
+    if !has_path {
+        diag.warn("missing 'path' attribute — falling back to span name as path");
+    }
+    diag
 }
 
-fn validate_llm_contract(span: &SpanRecord) -> Option<String> {
+fn validate_llm_contract(span: &SpanRecord) -> ContractDiagnostic {
     let has_model = matches!(span.attributes.get(attrs::MODEL), Some(Value::Text(_)))
         || span
             .executor_kind
             .as_deref()
             .is_some_and(|value| !value.is_empty());
     if !has_model {
-        return Some("LlmCall span has no 'model' attribute or executor kind".into());
+        return ContractDiagnostic::blocked(
+            "LlmCall span has no 'model' attribute or executor kind",
+        );
     }
-    None
+    let mut diag = ContractDiagnostic::ok();
+    if !matches!(span.attributes.get(attrs::PROVIDER), Some(Value::Text(_))) {
+        diag.warn("missing 'provider' attribute — needed for live model dispatch");
+    }
+    if !matches!(
+        span.attributes.get(attrs::MODEL_REQUEST_JSON),
+        Some(Value::Text(_))
+    ) {
+        diag.warn("missing 'model_request_json' attribute — replay fidelity reduced");
+    }
+    diag
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +1047,134 @@ mod tests {
         assert_eq!(
             result.output_artifacts[0].artifact_type,
             ArtifactType::ModelResponse
+        );
+    }
+
+    // -- Contract diagnostics -------------------------------------------------
+
+    #[test]
+    fn shell_warns_on_name_fallback() {
+        let span = make_span(SpanKind::ShellCommand, "echo hello");
+        let diag = validate_shell_contract(&span);
+        assert!(diag.block.is_none(), "should not block: {:?}", diag.block);
+        assert!(
+            diag.warnings.iter().any(|w| w.contains("command")),
+            "should warn about missing command attr: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn shell_warns_on_missing_cwd() {
+        let mut span = make_span(SpanKind::ShellCommand, "echo hello");
+        span.attributes
+            .insert(attrs::COMMAND.into(), Value::Text("echo hello".into()));
+        let diag = validate_shell_contract(&span);
+        assert!(diag.block.is_none());
+        assert!(
+            diag.warnings.iter().any(|w| w.contains("cwd")),
+            "should warn about missing cwd: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn shell_no_warnings_when_fully_specified() {
+        let mut span = make_span(SpanKind::ShellCommand, "echo hello");
+        span.attributes
+            .insert(attrs::COMMAND.into(), Value::Text("echo hello".into()));
+        span.attributes
+            .insert(attrs::CWD.into(), Value::Text("/tmp".into()));
+        let diag = validate_shell_contract(&span);
+        assert!(diag.block.is_none());
+        assert!(
+            diag.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn file_read_warns_on_name_fallback() {
+        let span = make_span(SpanKind::FileRead, "test.txt");
+        let diag = validate_file_read_contract(&span);
+        assert!(diag.block.is_none());
+        assert!(
+            diag.warnings.iter().any(|w| w.contains("path")),
+            "should warn about missing path attr: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn file_write_blocks_on_missing_content_at_contract() {
+        let mut span = make_span(SpanKind::FileWrite, "output.txt");
+        span.attributes
+            .insert(attrs::PATH.into(), Value::Text("output.txt".into()));
+        let diag = validate_file_write_contract(&span);
+        assert!(diag.block.is_some(), "should hard-block without content");
+        assert!(
+            diag.block.as_ref().unwrap().contains("content"),
+            "block reason should mention content: {:?}",
+            diag.block
+        );
+    }
+
+    #[test]
+    fn file_write_blocks_on_missing_path_and_empty_name() {
+        let span = make_span(SpanKind::FileWrite, "");
+        let diag = validate_file_write_contract(&span);
+        assert!(
+            diag.block.is_some(),
+            "should hard-block without path and name"
+        );
+    }
+
+    #[test]
+    fn llm_warns_on_missing_provider() {
+        let mut span = make_span(SpanKind::LlmCall, "test");
+        span.attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
+        let diag = validate_llm_contract(&span);
+        assert!(diag.block.is_none());
+        assert!(
+            diag.warnings.iter().any(|w| w.contains("provider")),
+            "should warn about missing provider: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn llm_warns_on_missing_model_request_json() {
+        let mut span = make_span(SpanKind::LlmCall, "test");
+        span.attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
+        span.attributes
+            .insert(attrs::PROVIDER.into(), Value::Text("openai".into()));
+        let diag = validate_llm_contract(&span);
+        assert!(diag.block.is_none());
+        assert!(
+            diag.warnings
+                .iter()
+                .any(|w| w.contains("model_request_json")),
+            "should warn about missing request json: {:?}",
+            diag.warnings
+        );
+    }
+
+    #[test]
+    fn composite_why_not_includes_warnings() {
+        let registry = CompositeExecutorRegistry::new();
+        let span = make_span(SpanKind::ShellCommand, "echo hello");
+        let reason = registry.why_not(&span);
+        assert!(
+            reason.is_some(),
+            "should return something for degraded span"
+        );
+        let msg = reason.unwrap();
+        assert!(
+            msg.contains("command"),
+            "should mention missing command: {msg}"
         );
     }
 }

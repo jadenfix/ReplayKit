@@ -292,14 +292,17 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
             target_run_id: target_run_id.clone(),
             fork_span_id: request.fork_span_id.clone(),
         };
+        // Map from a span to its upstream dependencies.
+        // Edge: from DataDependsOn to → from depends on to.
+        // So edge_map[from] = [to, ...] gives a span's upstream dependencies.
         let edge_map =
             source_edges
                 .iter()
                 .fold(BTreeMap::<SpanId, Vec<SpanId>>::new(), |mut map, edge| {
                     if edge.kind == EdgeKind::DataDependsOn {
-                        map.entry(edge.to_span_id.clone())
+                        map.entry(edge.from_span_id.clone())
                             .or_default()
-                            .push(edge.from_span_id.clone());
+                            .push(edge.to_span_id.clone());
                     }
                     map
                 });
@@ -678,11 +681,14 @@ fn compute_dirty_map(
         acc
     });
 
+    // Map from a span to all spans that depend on it.
+    // Edge semantics: from_span_id DataDependsOn to_span_id means "from depends on to".
+    // When to_span_id is dirty, from_span_id is a downstream dependent that must re-run.
     let data_dependents = edges.iter().fold(BTreeMap::new(), |mut acc, edge| {
         if edge.kind == EdgeKind::DataDependsOn {
-            acc.entry(edge.from_span_id.clone())
+            acc.entry(edge.to_span_id.clone())
                 .or_insert_with(Vec::new)
-                .push(edge.to_span_id.clone());
+                .push(edge.from_span_id.clone());
         }
         acc
     });
@@ -1007,12 +1013,13 @@ mod tests {
                 created_at: 3,
             })
             .unwrap();
+        // "answer depends on tool" — answer uses tool's output
         storage
             .insert_edge(SpanEdgeRecord {
                 edge_id: EdgeId("edge-1".into()),
                 run_id: run.run_id.clone(),
-                from_span_id: SpanId("tool".into()),
-                to_span_id: SpanId("answer".into()),
+                from_span_id: SpanId("answer".into()),
+                to_span_id: SpanId("tool".into()),
                 kind: EdgeKind::DataDependsOn,
                 attributes: Document::new(),
             })
@@ -1144,7 +1151,10 @@ mod tests {
         assert_eq!(answer.status, SpanStatus::Blocked);
         assert!(answer.output_artifact_ids.is_empty());
         let err = answer.error_summary.as_deref().expect("should have error");
-        assert!(err.starts_with("replay blocked:"), "unexpected error: {err}");
+        assert!(
+            err.starts_with("replay blocked:"),
+            "unexpected error: {err}"
+        );
         assert!(err.contains("LlmCall"), "should mention span kind: {err}");
     }
 
@@ -1351,22 +1361,24 @@ mod tests {
         storage.upsert_span(llm).unwrap();
         storage.upsert_span(file_write).unwrap();
         storage.upsert_span(shell).unwrap();
+        // "file-write depends on llm" (file-write uses llm's output)
         storage
             .insert_edge(SpanEdgeRecord {
                 edge_id: EdgeId("edge-llm-file".into()),
                 run_id: run.run_id.clone(),
-                from_span_id: SpanId("llm".into()),
-                to_span_id: SpanId("file-write".into()),
+                from_span_id: SpanId("file-write".into()),
+                to_span_id: SpanId("llm".into()),
                 kind: EdgeKind::DataDependsOn,
                 attributes: Document::new(),
             })
             .unwrap();
+        // "shell depends on file-write" (shell uses file-write's output)
         storage
             .insert_edge(SpanEdgeRecord {
                 edge_id: EdgeId("edge-file-shell".into()),
                 run_id: run.run_id.clone(),
-                from_span_id: SpanId("file-write".into()),
-                to_span_id: SpanId("shell".into()),
+                from_span_id: SpanId("shell".into()),
+                to_span_id: SpanId("file-write".into()),
                 kind: EdgeKind::DataDependsOn,
                 attributes: Document::new(),
             })
