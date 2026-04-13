@@ -1,14 +1,41 @@
 services:
-  replaykit:
+  collector:
     build:
       context: .
       dockerfile: Dockerfile
+    command: ["replaykit-collector"]
+    environment:
+      REPLAYKIT_PORT: "4100"
+      REPLAYKIT_DATA_ROOT: /data
+    ports:
+      - "4100:4100"
+    volumes:
+      - replaykit-data:/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "replaykit",
+        "--storage",
+        "sqlite",
+        "--data-root",
+        "/data",
+        "serve",
+        "--port",
+        "3210",
+        "--host",
+        "0.0.0.0",
+      ]
     environment:
       REPLAYKIT_STORAGE: sqlite
       REPLAYKIT_DATA_ROOT: /data
+    ports:
+      - "3210:3210"
     volumes:
       - replaykit-data:/data
-    command: ["demo-branch"]
 
 volumes:
   replaykit-data:

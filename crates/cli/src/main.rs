@@ -28,11 +28,7 @@ struct Cli {
     storage: String,
 
     /// Data root directory (when storage=sqlite). Contains replaykit.db and blob store.
-    #[arg(
-        long,
-        env = "REPLAYKIT_DATA_ROOT",
-        default_value = "data/replaykit"
-    )]
+    #[arg(long, env = "REPLAYKIT_DATA_ROOT", default_value = "data/replaykit")]
     data_root: String,
 
     /// Output as JSON instead of human-readable text
@@ -60,6 +56,9 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value = "3210")]
         port: u16,
+        /// Host address to bind to
+        #[arg(long, env = "REPLAYKIT_HOST", default_value = "127.0.0.1")]
+        host: String,
     },
     /// Seed a demo run (for testing)
     Demo,
@@ -192,7 +191,10 @@ fn main() {
 }
 
 fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
-    let service = Arc::new(ReplayKitService::new(storage.clone(), CompositeExecutorRegistry::new()));
+    let service = Arc::new(ReplayKitService::new(
+        storage.clone(),
+        CompositeExecutorRegistry::new(),
+    ));
     let json = cli.json;
 
     match cli.command {
@@ -234,7 +236,7 @@ fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
                 replacement,
             } => cmd_replay_plan(&service, &run_id, &span, &patch_type, &replacement, json),
         },
-        Commands::Serve { port } => cmd_serve(service, port),
+        Commands::Serve { port, host } => cmd_serve(service, port, &host),
         Commands::Demo => cmd_demo(storage, &service, json),
         Commands::DemoBranch => cmd_demo_branch(storage, &service, json),
     }
@@ -589,13 +591,15 @@ fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
 fn cmd_serve<S: Storage + 'static, E: replaykit_replay_engine::ExecutorRegistry + 'static>(
     service: Arc<ReplayKitService<S, E>>,
     port: u16,
+    host: &str,
 ) {
     let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
         die_msg(&format!("failed to start tokio runtime: {e}"));
     });
+    let host = host.to_owned();
     rt.block_on(async {
         let router = replaykit_api::server::build_router(service);
-        let addr = format!("127.0.0.1:{port}");
+        let addr = format!("{host}:{port}");
         println!("ReplayKit API server listening on http://{addr}");
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
