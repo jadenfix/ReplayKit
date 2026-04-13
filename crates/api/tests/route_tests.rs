@@ -610,7 +610,47 @@ async fn artifact_content_returns_200_for_stored_blob() {
     resp.assert_status_ok();
     let body: serde_json::Value = resp.json();
     assert_eq!(body["artifact_id"], "blob-artifact");
-    assert_eq!(body["content"], "{\"ok\":true}");
+    assert_eq!(body["content_encoding"], "utf-8");
+    assert_eq!(body["content"].as_str().unwrap(), r#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn artifact_content_binary_round_trips_via_base64() {
+    let (server, run_id, storage) = seeded_server_with_storage();
+    let binary_bytes: &[u8] = b"\xff\xfe\x00\x01binary content";
+    let artifact = replaykit_core_model::ArtifactRecord {
+        artifact_id: replaykit_core_model::ArtifactId("binary-artifact".into()),
+        run_id: run_id.clone(),
+        span_id: None,
+        artifact_type: ArtifactType::Screenshot,
+        mime: "image/png".into(),
+        sha256: "placeholder".into(),
+        byte_len: 0,
+        blob_path: "memory://placeholder".into(),
+        summary: Document::new(),
+        redaction: Document::new(),
+        created_at: 10,
+    };
+    storage
+        .store_artifact_with_content(artifact, binary_bytes)
+        .unwrap();
+
+    let resp = server
+        .get(&format!(
+            "/api/v1/runs/{}/artifacts/{}/content",
+            run_id.0, "binary-artifact"
+        ))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["artifact_id"], "binary-artifact");
+    assert_eq!(body["content_encoding"], "base64");
+
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, binary_bytes);
 }
 
 #[tokio::test]

@@ -314,11 +314,18 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
 
     pub fn create_branch(&self, request: BranchRequest) -> Result<BranchExecution, ApiError> {
         let execution = self.replay.execute_fork(request)?;
-        self.diff.diff_runs(
+        if let Err(e) = self.diff.diff_runs(
             &execution.branch.source_run_id,
             &execution.branch.target_run_id,
             execution.branch.created_at,
-        )?;
+        ) {
+            tracing::warn!(
+                error = ?e,
+                source = %execution.branch.source_run_id.0,
+                target = %execution.branch.target_run_id.0,
+                "diff computation failed after branch creation"
+            );
+        }
         Ok(execution)
     }
 
