@@ -99,6 +99,7 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
     let fread = session
         .record_completed_span(
             file_read("read test_auth.rs")
+                .path("tests/test_auth.rs")
                 .span_id("file-read-001")
                 .parent(&planner.span_id)
                 .times(111, 115)
@@ -115,14 +116,16 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
     let llm = session
         .record_completed_span(
             model_call("generate fix")
+                .provider("anthropic")
+                .model("claude-sonnet-4-6")
                 .span_id("llm-001")
                 .parent(&planner.span_id)
                 .times(116, 130)
-                .executor("claude-3.5-sonnet", "2024-10-22")
+                .executor("claude-sonnet-4-6", "2025-05-14")
                 .input(
                     ArtifactType::ModelRequest,
                     summary_from_pairs(&[
-                        ("model", "claude-3.5-sonnet"),
+                        ("model", "claude-sonnet-4-6"),
                         ("prompt_tokens", "1200"),
                     ]),
                 )
@@ -152,6 +155,8 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
     let fwrite = session
         .record_completed_span(
             file_write("apply patch")
+                .path("tests/test_auth.rs")
+                .write_content("fn test_auth() { assert!(login(\"user\", \"pass\").is_ok()); }")
                 .span_id("file-write-001")
                 .parent(&planner.span_id)
                 .times(131, 140)
@@ -177,6 +182,7 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
     let shell = session
         .record_completed_span(
             shell_command("cargo test")
+                .command("cargo test --test auth")
                 .span_id("shell-001")
                 .parent(&planner.span_id)
                 .times(141, 160)
@@ -247,6 +253,7 @@ pub fn generate_success_coding_agent() -> FixtureRun {
     let fread = session
         .record_completed_span(
             file_read("read test_auth.rs")
+                .path("tests/test_auth.rs")
                 .span_id("file-read-001")
                 .parent(&planner.span_id)
                 .times(211, 215)
@@ -262,14 +269,16 @@ pub fn generate_success_coding_agent() -> FixtureRun {
     let llm = session
         .record_completed_span(
             model_call("generate fix")
+                .provider("openai")
+                .model("gpt-5.4")
                 .span_id("llm-001")
                 .parent(&planner.span_id)
                 .times(216, 230)
-                .executor("claude-3.5-sonnet", "2024-10-22")
+                .executor("gpt-5.4", "2025-06-01")
                 .input(
                     ArtifactType::ModelRequest,
                     summary_from_pairs(&[
-                        ("model", "claude-3.5-sonnet"),
+                        ("model", "gpt-5.4"),
                         ("prompt_tokens", "1250"),
                     ]),
                 )
@@ -294,6 +303,8 @@ pub fn generate_success_coding_agent() -> FixtureRun {
     let fwrite = session
         .record_completed_span(
             file_write("apply patch")
+                .path("tests/test_auth.rs")
+                .write_content("fn test_auth() { let result = login(\"user\", \"pass\"); assert!(result.is_ok()); }")
                 .span_id("file-write-001")
                 .parent(&planner.span_id)
                 .times(231, 240)
@@ -318,6 +329,7 @@ pub fn generate_success_coding_agent() -> FixtureRun {
     let shell = session
         .record_completed_span(
             shell_command("cargo test")
+                .command("cargo test --test auth")
                 .span_id("shell-001")
                 .parent(&planner.span_id)
                 .times(241, 260)
@@ -568,6 +580,94 @@ mod tests {
         let failed_ids: Vec<_> = failed.spans.iter().map(|s| &s.span_id).collect();
         let success_ids: Vec<_> = success.spans.iter().map(|s| &s.span_id).collect();
         assert_eq!(failed_ids, success_ids);
+    }
+
+    #[test]
+    fn prompt_edit_with_fake_model_unblocks_llm_span() {
+        use replaykit_core_model::{BranchRequest, PatchManifest, PatchType, Value};
+        use replaykit_replay_engine::executors::{
+            CompositeExecutorRegistry, FakeModelExecutor, ModelExecutorMode,
+        };
+        use replaykit_replay_engine::ReplayEngine;
+
+        let fixture = generate_failed_coding_agent();
+        let storage = Arc::new(InMemoryStorage::new());
+
+        // Load fixture into storage
+        storage.insert_run(fixture.run.clone()).unwrap();
+        for span in &fixture.spans {
+            storage.upsert_span(span.clone()).unwrap();
+        }
+        for artifact in &fixture.artifacts {
+            storage.insert_artifact(artifact.clone()).unwrap();
+        }
+        for edge in &fixture.edges {
+            storage.insert_edge(edge.clone()).unwrap();
+        }
+
+        // Advance ID counters past fixture-allocated IDs so execute_fork
+        // doesn't generate colliding IDs.
+        use replaykit_core_model::IdKind;
+        for kind in [
+            IdKind::Run, IdKind::Trace, IdKind::Branch, IdKind::ReplayJob,
+            IdKind::Diff, IdKind::Snapshot, IdKind::Event,
+        ] {
+            let _ = storage.allocate_id(kind);
+        }
+        for _ in 0..fixture.artifacts.len() + 2 {
+            let _ = storage.allocate_id(IdKind::Artifact);
+        }
+        for _ in 0..fixture.edges.len() + 2 {
+            let _ = storage.allocate_id(IdKind::Edge);
+        }
+
+        let fake = FakeModelExecutor::new("fn test_auth() { assert!(true); }")
+            .with_response("generate fix", "fn test_auth() { assert!(true); }");
+        let registry = CompositeExecutorRegistry::new()
+            .with_model_mode(ModelExecutorMode::Fake(fake));
+        let engine = ReplayEngine::new(storage.clone(), registry);
+
+        let request = BranchRequest {
+            source_run_id: fixture.run.run_id.clone(),
+            fork_span_id: SpanId("llm-001".into()),
+            patch_manifest: PatchManifest {
+                patch_type: PatchType::PromptEdit,
+                target_artifact_id: None,
+                replacement: Value::Text("generate a better fix".into()),
+                note: Some("testing prompt edit".into()),
+                created_at: 500,
+            },
+            created_by: Some("test".into()),
+        };
+
+        let execution = engine.execute_fork(request).unwrap();
+
+        // The LLM span itself should NOT be blocked (FakeModelExecutor handles it).
+        // Downstream spans may fail/block in test environment (no real files/commands).
+        let llm_span = storage
+            .get_span(&execution.target_run.run_id, &SpanId("llm-001".into()))
+            .unwrap();
+        assert_eq!(
+            llm_span.status,
+            SpanStatus::Completed,
+            "LLM span should be Completed via FakeModelExecutor, got: {:?} / {:?}",
+            llm_span.status,
+            llm_span.error_summary,
+        );
+        assert!(
+            llm_span.output_fingerprint.is_some(),
+            "LLM span should have a new output fingerprint"
+        );
+        assert_eq!(llm_span.output_artifact_ids.len(), 1);
+
+        // The plan should show llm-001 as dirty (patched) and downstream spans too
+        let dirty_ids: Vec<_> = execution
+            .plan
+            .dirty_spans
+            .iter()
+            .map(|d| d.span_id.0.as_str())
+            .collect();
+        assert!(dirty_ids.contains(&"llm-001"), "llm should be dirty");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use replaykit_core_model::{
-    ArtifactType, CostMetrics, Document, ReplayPolicy, SpanId, SpanKind, SpanStatus,
+    ArtifactType, CostMetrics, Document, ReplayPolicy, SpanId, SpanKind, SpanStatus, Value, attrs,
 };
 
 use crate::CompletedSpanSpec;
@@ -119,9 +119,57 @@ impl SpanBuilder {
         self
     }
 
-    /// Set freeform attributes.
-    pub fn attributes(mut self, attrs: Document) -> Self {
-        self.spec.attributes = attrs;
+    /// Merge freeform attributes into the span's attribute map.
+    pub fn attributes(mut self, extra: Document) -> Self {
+        self.spec.attributes.extend(extra);
+        self
+    }
+
+    /// Set the shell command string (ShellCommand spans).
+    pub fn command(mut self, cmd: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::COMMAND.into(), Value::Text(cmd.into()));
+        self
+    }
+
+    /// Set the working directory (ShellCommand spans).
+    pub fn cwd(mut self, dir: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::CWD.into(), Value::Text(dir.into()));
+        self
+    }
+
+    /// Set execution timeout in milliseconds (ShellCommand spans).
+    pub fn timeout_ms(mut self, ms: u64) -> Self {
+        self.spec.attributes.insert(attrs::TIMEOUT_MS.into(), Value::Int(ms as i64));
+        self
+    }
+
+    /// Set the filesystem path (FileRead/FileWrite spans).
+    pub fn path(mut self, p: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::PATH.into(), Value::Text(p.into()));
+        self
+    }
+
+    /// Set the content to write (FileWrite spans).
+    pub fn write_content(mut self, content: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::CONTENT.into(), Value::Text(content.into()));
+        self
+    }
+
+    /// Set the model provider name (LlmCall spans).
+    pub fn provider(mut self, name: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::PROVIDER.into(), Value::Text(name.into()));
+        self
+    }
+
+    /// Set the model identifier (LlmCall spans).
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::MODEL.into(), Value::Text(name.into()));
+        self
+    }
+
+    /// Set the serialized model request payload (LlmCall spans).
+    pub fn model_request_json(mut self, json: impl Into<String>) -> Self {
+        self.spec.attributes.insert(attrs::MODEL_REQUEST_JSON.into(), Value::Text(json.into()));
         self
     }
 

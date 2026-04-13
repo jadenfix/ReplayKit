@@ -88,6 +88,15 @@ pub trait ExecutorRegistry: Send + Sync {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError>;
+
+    /// Explain why a span cannot be executed. Returns `None` if supported.
+    fn why_not(&self, span: &SpanRecord) -> Option<String> {
+        if self.supports(span) {
+            None
+        } else {
+            Some(format!("no executor for span kind {:?}", span.kind))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -370,7 +379,11 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
 
             target_span.status = SpanStatus::Blocked;
             target_span.ended_at = Some(now);
-            target_span.error_summary = Some("replay blocked: no executor registered".into());
+            let reason = self
+                .executors
+                .why_not(&target_span)
+                .unwrap_or_else(|| "no executor registered".into());
+            target_span.error_summary = Some(format!("replay blocked: {reason}"));
             self.storage.upsert_span(target_span)?;
         }
 
@@ -1130,10 +1143,9 @@ mod tests {
             .unwrap();
         assert_eq!(answer.status, SpanStatus::Blocked);
         assert!(answer.output_artifact_ids.is_empty());
-        assert_eq!(
-            answer.error_summary.as_deref(),
-            Some("replay blocked: no executor registered")
-        );
+        let err = answer.error_summary.as_deref().expect("should have error");
+        assert!(err.starts_with("replay blocked:"), "unexpected error: {err}");
+        assert!(err.contains("LlmCall"), "should mention span kind: {err}");
     }
 
     #[test]
@@ -1389,9 +1401,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(llm.status, SpanStatus::Blocked);
-        assert_eq!(
-            llm.error_summary.as_deref(),
-            Some("replay blocked: no executor registered")
+        let llm_err = llm.error_summary.as_deref().expect("llm should have error");
+        assert!(
+            llm_err.starts_with("replay blocked:"),
+            "unexpected error: {llm_err}"
+        );
+        assert!(
+            llm_err.contains("LlmCall"),
+            "should mention LlmCall: {llm_err}"
         );
         assert_eq!(file_write.status, SpanStatus::Blocked);
         assert!(

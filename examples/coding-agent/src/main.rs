@@ -46,6 +46,7 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
     let fread = session
         .record_completed_span(
             file_read("read test_auth.rs")
+                .path("tests/test_auth.rs")
                 .span_id("file-read")
                 .parent(&planner.span_id)
                 .times(111, 115)
@@ -62,14 +63,16 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
     let llm = session
         .record_completed_span(
             model_call("generate fix")
+                .provider("anthropic")
+                .model("claude-sonnet-4-6")
                 .span_id("llm-call")
                 .parent(&planner.span_id)
                 .times(116, 130)
-                .executor("claude-3.5-sonnet", "2024-10-22")
+                .executor("claude-sonnet-4-6", "2025-05-14")
                 .input(
                     ArtifactType::ModelRequest,
                     summary_from_pairs(&[
-                        ("model", "claude-3.5-sonnet"),
+                        ("model", "claude-sonnet-4-6"),
                         ("prompt_tokens", "1200"),
                     ]),
                 )
@@ -95,6 +98,8 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
     let fwrite = session
         .record_completed_span(
             file_write("apply patch")
+                .path("tests/test_auth.rs")
+                .write_content("fn test_auth() { assert!(login(\"user\", \"pass\").is_ok()); }")
                 .span_id("file-write")
                 .parent(&planner.span_id)
                 .times(131, 140)
@@ -119,6 +124,7 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
     let shell = session
         .record_completed_span(
             shell_command("cargo test")
+                .command("cargo test --test auth")
                 .span_id("shell-test")
                 .parent(&planner.span_id)
                 .times(141, 160)
