@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -176,10 +176,13 @@ pub struct AddArtifactRequest {
     #[serde(default)]
     pub redaction: Document,
     pub created_at: u64,
-    /// Optional base64 or inline content. When provided via the upload
-    /// endpoint, this is populated from the raw body instead.
     #[serde(default)]
-    pub content: Option<String>,
+    pub span_id: Option<String>,
+    /// Optional base64-encoded content. When provided, the collector stores
+    /// the decoded bytes in the managed blob store and populates sha256,
+    /// byte_len, and blob_path automatically.
+    #[serde(default)]
+    pub content_base64: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -348,9 +351,22 @@ async fn add_artifact(
     Json(req): Json<AddArtifactRequest>,
 ) -> ApiResult<replaykit_core_model::ArtifactRecord> {
     let run_id = RunId(run_id);
+    let span_id = req.span_id.map(SpanId);
+    let content = match req.content_base64 {
+        Some(b64) => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| {
+                    CollectorError::InvalidInput(format!("invalid base64 content: {e}"))
+                })?;
+            Some(bytes)
+        }
+        None => None,
+    };
     let artifact = state.collector.add_artifact(
         &run_id,
-        None,
+        span_id.as_ref(),
         ArtifactSpec {
             artifact_type: req.artifact_type,
             mime: req.mime,
@@ -360,7 +376,7 @@ async fn add_artifact(
             summary: req.summary,
             redaction: req.redaction,
             created_at: req.created_at,
-            content: req.content.map(|s| s.into_bytes()),
+            content,
         },
     )?;
     tracing::debug!(
@@ -371,18 +387,32 @@ async fn add_artifact(
     Ok(Json(artifact))
 }
 
+#[derive(Deserialize, Default)]
+pub struct UploadArtifactQuery {
+    #[serde(default)]
+    pub artifact_type: Option<ArtifactType>,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub span_id: Option<String>,
+}
+
 async fn upload_artifact(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(query): Query<UploadArtifactQuery>,
     body: Bytes,
 ) -> ApiResult<ArtifactUploadResponse> {
     let run_id = RunId(run_id);
+    let span_id = query.span_id.map(SpanId);
     let artifact = state.collector.add_artifact(
         &run_id,
-        None,
+        span_id.as_ref(),
         ArtifactSpec {
-            artifact_type: ArtifactType::FileBlob,
-            mime: "application/octet-stream".into(),
+            artifact_type: query.artifact_type.unwrap_or(ArtifactType::FileBlob),
+            mime: query
+                .mime
+                .unwrap_or_else(|| "application/octet-stream".into()),
             sha256: String::new(),
             byte_len: 0,
             blob_path: String::new(),
@@ -610,7 +640,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let span_id = span["span_id"].as_str().unwrap();
 
-        // 3. Add artifact with content.
+        // 3. Add artifact with base64 content attached to span.
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello world");
         let (status, artifact) = post_json(
             &app,
             &format!("/v1/runs/{run_id}/artifacts"),
@@ -618,13 +650,15 @@ mod tests {
                 "artifact_type": "ToolOutput",
                 "mime": "text/plain",
                 "created_at": 3,
-                "content": "hello world"
+                "span_id": span_id,
+                "content_base64": b64
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert!(!artifact["sha256"].as_str().unwrap().is_empty());
         assert_eq!(artifact["byte_len"].as_u64().unwrap(), 11);
+        assert_eq!(artifact["span_id"].as_str().unwrap(), span_id);
 
         // 4. End span.
         let (status, _) = post_json(

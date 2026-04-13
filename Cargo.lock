@@ -1003,6 +1003,7 @@ name = "replaykit-collector"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "replaykit-core-model",
  "replaykit-storage",
  "reqwest",

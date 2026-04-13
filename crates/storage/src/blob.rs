@@ -112,8 +112,19 @@ impl BlobStore for LocalBlobStore {
         }
 
         // Write to temp file, fsync, then atomic rename.
+        // Use a unique temp name (PID + nanos) to avoid races when two
+        // concurrent writers store the same content simultaneously.
         let tmp_dir = self.root.join("blobs").join(".tmp");
-        let tmp_path = tmp_dir.join(format!("{hash}.tmp"));
+        let unique = format!(
+            "{}.{}.{}.tmp",
+            hash,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp_path = tmp_dir.join(unique);
 
         let mut file = fs::File::create(&tmp_path).map_err(|e| {
             StorageError::Internal(format!(
