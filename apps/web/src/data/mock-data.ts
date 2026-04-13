@@ -5,6 +5,7 @@
 import type {
   RunRecord, SpanRecord, ArtifactRecord, SpanEdgeRecord,
   BranchRecord, RunListItem, SpanTreeNode, DiffSummary,
+  TimelineView, ForensicsReport, TimelineEntryView,
 } from '../types';
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -744,6 +745,133 @@ export function getDiffForRuns(sourceId: string, targetId: string): DiffSummary 
   if (sourceId === 'run_01' && targetId === 'run_02') return DIFF_01_02;
   if (sourceId === 'run_02' && targetId === 'run_01') return DIFF_01_02;
   return null;
+}
+
+// ── Timeline mock data ──────────────────────────────────────────────
+
+function buildTimelineForRun(runId: string): TimelineView | null {
+  const run = RUNS.find(r => r.run_id === runId);
+  if (!run) return null;
+  const spans = getSpansForRun(runId);
+  if (spans.length === 0) return null;
+
+  // Compute depth from parent_span_id chains
+  const depthMap = new Map<string, number>();
+  for (const s of spans) {
+    if (!s.parent_span_id) {
+      depthMap.set(s.span_id, 0);
+    }
+  }
+  // Multiple passes to resolve
+  for (let pass = 0; pass < 5; pass++) {
+    for (const s of spans) {
+      if (s.parent_span_id && depthMap.has(s.parent_span_id)) {
+        depthMap.set(s.span_id, (depthMap.get(s.parent_span_id) ?? 0) + 1);
+      }
+    }
+  }
+
+  const sorted = [...spans].sort((a, b) => a.started_at - b.started_at);
+  const entries: TimelineEntryView[] = sorted.map(s => ({
+    span_id: s.span_id,
+    name: s.name,
+    kind: s.kind,
+    status: s.status,
+    status_label: s.status,
+    started_at: s.started_at,
+    ended_at: s.ended_at,
+    depth: depthMap.get(s.span_id) ?? 0,
+    parent_span_id: s.parent_span_id,
+    error_summary: s.error_summary,
+  }));
+
+  const minStart = Math.min(...entries.map(e => e.started_at));
+  const maxEnd = Math.max(...entries.map(e => e.ended_at ?? e.started_at));
+
+  return {
+    run_id: run.run_id,
+    title: run.title,
+    status: run.status,
+    total_started_at: minStart,
+    total_ended_at: maxEnd,
+    entries,
+  };
+}
+
+export function getTimelineForRun(runId: string): TimelineView | null {
+  return buildTimelineForRun(runId);
+}
+
+// ── Forensics mock data ────────────────────────────────────────────
+
+export function getForensicsForRun(runId: string): ForensicsReport | null {
+  const run = RUNS.find(r => r.run_id === runId);
+  if (!run) return null;
+
+  const spans = getSpansForRun(runId);
+  const failedSpans = spans.filter(s => s.status === 'Failed');
+  const blockedSpans = spans.filter(s => s.status === 'Blocked');
+
+  if (failedSpans.length === 0 && blockedSpans.length === 0) {
+    return {
+      run_id: runId,
+      has_failure: false,
+      first_failed_span_id: null,
+      deepest_failed_span_id: null,
+      deepest_failing_dependency_id: null,
+      failure_path: [],
+      blocked_spans: [],
+      retry_groups: [],
+    };
+  }
+
+  // Find first and deepest failed
+  const sortedFailed = [...failedSpans].sort((a, b) => a.started_at - b.started_at);
+  const firstFailed = sortedFailed[0]?.span_id ?? null;
+
+  // Deepest = the failed span with greatest depth
+  const depthMap = new Map<string, number>();
+  for (const s of spans) {
+    if (!s.parent_span_id) depthMap.set(s.span_id, 0);
+  }
+  for (let pass = 0; pass < 5; pass++) {
+    for (const s of spans) {
+      if (s.parent_span_id && depthMap.has(s.parent_span_id)) {
+        depthMap.set(s.span_id, (depthMap.get(s.parent_span_id) ?? 0) + 1);
+      }
+    }
+  }
+  const deepestFailed = failedSpans.reduce<SpanRecord | null>((best, s) => {
+    const d = depthMap.get(s.span_id) ?? 0;
+    const bestD = best ? (depthMap.get(best.span_id) ?? 0) : -1;
+    return d > bestD ? s : best;
+  }, null);
+
+  // Build failure path from root to deepest
+  const failurePath: string[] = [];
+  if (deepestFailed) {
+    let current: string | null = deepestFailed.span_id;
+    while (current) {
+      failurePath.unshift(current);
+      const span = spans.find(s => s.span_id === current);
+      current = span?.parent_span_id ?? null;
+    }
+  }
+
+  return {
+    run_id: runId,
+    has_failure: failedSpans.length > 0,
+    first_failed_span_id: firstFailed,
+    deepest_failed_span_id: deepestFailed?.span_id ?? null,
+    deepest_failing_dependency_id: null,
+    failure_path: failurePath,
+    blocked_spans: blockedSpans.map(s => ({
+      span_id: s.span_id,
+      name: s.name,
+      reason: s.blocked_replay_reason ?? s.error_summary,
+    })),
+    retry_groups: [],
+  };
 }
 
 // Re-export tree utilities from utils.ts for backward compat

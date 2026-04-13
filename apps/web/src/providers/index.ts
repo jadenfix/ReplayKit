@@ -4,6 +4,7 @@ import type {
   RunListItem, RunRecord, SpanRecord, SpanTreeNode,
   ArtifactRecord, SpanEdgeRecord, BranchRecord,
   DiffSummary, BranchDraftState, ReplayPolicy, PatchType,
+  TimelineView, ForensicsReport, SpanDiff,
 } from '../types';
 
 type ApiRunSummary = {
@@ -108,7 +109,52 @@ type ApiDiffSummary = {
   changed_span_count: number;
   changed_artifact_count: number;
   first_divergent_span_id: string | null;
+  span_diffs?: ApiSpanDiff[];
+  latency_ms_delta?: number | null;
+  token_delta?: number | null;
+  final_output_changed?: boolean;
   summary: Record<string, unknown>;
+};
+
+type ApiSpanDiff = {
+  span_id_source: string;
+  span_id_target: string;
+  name: string;
+  status_change?: string | null;
+  duration_ms_delta?: number | null;
+  output_changed: boolean;
+  dirty_reason?: string | null;
+};
+
+type ApiTimelineView = {
+  run_id: string;
+  title: string;
+  status: RunRecord['status'];
+  total_started_at: number;
+  total_ended_at: number | null;
+  entries: Array<{
+    span_id: string;
+    name: string;
+    kind: SpanRecord['kind'];
+    status: SpanRecord['status'];
+    status_label: string;
+    started_at: number;
+    ended_at: number | null;
+    depth: number;
+    parent_span_id: string | null;
+    error_summary: string | null;
+  }>;
+};
+
+type ApiForensicsReport = {
+  run_id: string;
+  has_failure: boolean;
+  first_failed_span_id: string | null;
+  deepest_failed_span_id: string | null;
+  deepest_failing_dependency_id: string | null;
+  failure_path: string[];
+  blocked_spans: Array<{ span_id: string; name: string; reason: string | null }>;
+  retry_groups: Array<{ span_ids: string[]; final_status: SpanRecord['status']; final_status_label: string }>;
 };
 
 // ── Provider interface ──────────────────────────────────────────────
@@ -123,6 +169,8 @@ export interface ReplayKitProvider {
   getBranches(runId: string): Promise<BranchRecord[]>;
   getDiffSummary(sourceRunId: string, targetRunId: string): Promise<DiffSummary | null>;
   createBranch(draft: BranchDraftState): Promise<BranchRecord>;
+  getTimeline(runId: string): Promise<TimelineView | null>;
+  getForensics(runId: string): Promise<ForensicsReport | null>;
 }
 
 // ── Mock provider ───────────────────────────────────────────────────
@@ -130,7 +178,7 @@ export interface ReplayKitProvider {
 import {
   RUN_LIST, getRunRecord, getSpansForRun, buildTree,
   getArtifactsForSpan, getEdgesForRun, BRANCHES,
-  getDiffForRuns,
+  getDiffForRuns, getTimelineForRun, getForensicsForRun,
 } from '../data/mock-data';
 
 function delay(ms = 80): Promise<void> {
@@ -192,6 +240,16 @@ export class MockProvider implements ReplayKitProvider {
       created_at: Date.now(),
       status: 'Running',
     };
+  }
+
+  async getTimeline(runId: string): Promise<TimelineView | null> {
+    await delay(60);
+    return getTimelineForRun(runId);
+  }
+
+  async getForensics(runId: string): Promise<ForensicsReport | null> {
+    await delay(50);
+    return getForensicsForRun(runId);
   }
 }
 
@@ -340,18 +398,27 @@ export class LiveProvider implements ReplayKitProvider {
     const diff = await this.fetch<ApiDiffSummary>(
       `/api/v1/runs/${sourceRunId}/diff/${targetRunId}`,
     );
+    const spanDiffs: SpanDiff[] = (diff.span_diffs ?? []).map(sd => ({
+      span_id_source: sd.span_id_source,
+      span_id_target: sd.span_id_target,
+      name: sd.name,
+      status_change: sd.status_change ? parseStatusChange(sd.status_change) : null,
+      duration_ms_delta: sd.duration_ms_delta ?? null,
+      output_changed: sd.output_changed,
+      dirty_reason: (sd.dirty_reason as SpanDiff['dirty_reason']) ?? null,
+    }));
     return {
       diff_id: diff.diff_id,
       source_run_id: diff.source_run_id,
       target_run_id: diff.target_run_id,
       first_divergent_span_id: diff.first_divergent_span_id ?? '',
       status_change: { from: diff.source_status, to: diff.target_status },
-      latency_ms_delta: readInt(diff.summary, 'latency_ms_delta'),
-      token_delta: readInt(diff.summary, 'token_delta'),
+      latency_ms_delta: diff.latency_ms_delta ?? readInt(diff.summary, 'latency_ms_delta'),
+      token_delta: diff.token_delta ?? readInt(diff.summary, 'token_delta'),
       changed_span_count: diff.changed_span_count,
       changed_artifact_count: diff.changed_artifact_count,
-      final_output_changed: readBool(diff.summary, 'final_output_changed'),
-      span_diffs: [],
+      final_output_changed: diff.final_output_changed ?? readBool(diff.summary, 'final_output_changed'),
+      span_diffs: spanDiffs,
     };
   }
 
@@ -380,6 +447,48 @@ export class LiveProvider implements ReplayKitProvider {
       status: execution.target_status,
     };
   }
+
+  async getTimeline(runId: string): Promise<TimelineView | null> {
+    try {
+      const data = await this.fetch<ApiTimelineView>(`/api/v1/runs/${runId}/timeline`);
+      return {
+        run_id: data.run_id,
+        title: data.title,
+        status: data.status,
+        total_started_at: data.total_started_at,
+        total_ended_at: data.total_ended_at,
+        entries: data.entries,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async getForensics(runId: string): Promise<ForensicsReport | null> {
+    try {
+      const data = await this.fetch<ApiForensicsReport>(`/api/v1/runs/${runId}/forensics`);
+      return {
+        run_id: data.run_id,
+        has_failure: data.has_failure,
+        first_failed_span_id: data.first_failed_span_id,
+        deepest_failed_span_id: data.deepest_failed_span_id,
+        deepest_failing_dependency_id: data.deepest_failing_dependency_id,
+        failure_path: data.failure_path,
+        blocked_spans: data.blocked_spans,
+        retry_groups: data.retry_groups,
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+function parseStatusChange(s: string): { from: SpanRecord['status']; to: SpanRecord['status'] } | null {
+  const parts = s.split(' -> ');
+  if (parts.length === 2) {
+    return { from: parts[0] as SpanRecord['status'], to: parts[1] as SpanRecord['status'] };
+  }
+  return null;
 }
 
 function mapTreeNode(

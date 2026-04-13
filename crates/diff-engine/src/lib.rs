@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use replaykit_core_model::{DiffId, Document, IdKind, RunDiffRecord, RunId, Value};
+use replaykit_core_model::{
+    DiffId, Document, IdKind, RunDiffRecord, RunId, SpanId, SpanRecord, Value,
+};
 use replaykit_storage::{Storage, StorageError};
 
 #[derive(Debug)]
@@ -66,19 +68,47 @@ impl<S: Storage> DiffEngine<S> {
 
         let mut first_divergent_span_id = None;
         let mut changed_span_count = 0usize;
+        let mut span_diffs = Vec::new();
 
-        for span_id in ordered_span_ids {
-            let source_span = source_map.get(&span_id);
-            let target_span = target_map.get(&span_id);
+        for span_id in &ordered_span_ids {
+            let source_span = source_map.get(span_id);
+            let target_span = target_map.get(span_id);
             if spans_differ(source_span, target_span) {
                 changed_span_count += 1;
                 if first_divergent_span_id.is_none() {
-                    first_divergent_span_id = Some(span_id);
+                    first_divergent_span_id = Some(span_id.clone());
                 }
+                span_diffs.push(build_span_diff(span_id, source_span, target_span));
             }
         }
 
         let changed_artifact_count = count_changed_artifacts(&source_artifacts, &target_artifacts);
+
+        // Compute deltas
+        let source_duration = source_run
+            .ended_at
+            .map(|e| e.saturating_sub(source_run.started_at));
+        let target_duration = target_run
+            .ended_at
+            .map(|e| e.saturating_sub(target_run.started_at));
+        let latency_ms_delta = match (source_duration, target_duration) {
+            (Some(s), Some(t)) => Some(t as i64 - s as i64),
+            _ => None,
+        };
+
+        let source_tokens: u64 = source_map
+            .values()
+            .map(|s| s.cost.input_tokens + s.cost.output_tokens)
+            .sum();
+        let target_tokens: u64 = target_map
+            .values()
+            .map(|s| s.cost.input_tokens + s.cost.output_tokens)
+            .sum();
+        let token_delta = target_tokens as i64 - source_tokens as i64;
+
+        let final_output_changed =
+            source_run.summary.final_output_preview != target_run.summary.final_output_preview;
+
         let mut summary = Document::new();
         summary.insert(
             "source_status".into(),
@@ -102,6 +132,39 @@ impl<S: Storage> DiffEngine<S> {
                 Value::Text(span_id.0.clone()),
             );
         }
+        if let Some(delta) = latency_ms_delta {
+            summary.insert("latency_ms_delta".into(), Value::Int(delta));
+        }
+        summary.insert("token_delta".into(), Value::Int(token_delta));
+        summary.insert(
+            "final_output_changed".into(),
+            Value::Bool(final_output_changed),
+        );
+        summary.insert(
+            "span_diffs".into(),
+            Value::Array(
+                span_diffs
+                    .iter()
+                    .map(|sd| {
+                        let mut obj = Document::new();
+                        obj.insert("span_id_source".into(), Value::Text(sd.0.clone()));
+                        obj.insert("span_id_target".into(), Value::Text(sd.0.clone()));
+                        obj.insert("name".into(), Value::Text(sd.1.clone()));
+                        if let Some(ref sc) = sd.2 {
+                            obj.insert("status_change".into(), Value::Text(sc.clone()));
+                        }
+                        if let Some(d) = sd.3 {
+                            obj.insert("duration_ms_delta".into(), Value::Int(d));
+                        }
+                        obj.insert("output_changed".into(), Value::Bool(sd.4));
+                        if let Some(ref dr) = sd.5 {
+                            obj.insert("dirty_reason".into(), Value::Text(dr.clone()));
+                        }
+                        Value::Object(obj)
+                    })
+                    .collect(),
+            ),
+        );
 
         let diff = RunDiffRecord {
             diff_id: DiffId(self.storage.allocate_id(IdKind::Diff)?),
@@ -128,6 +191,64 @@ impl<S: Storage> DiffEngine<S> {
             .get_diff(source_run_id, target_run_id)
             .map_err(Into::into)
     }
+}
+
+/// Returns (span_id, name, status_change, duration_ms_delta, output_changed, dirty_reason)
+fn build_span_diff(
+    span_id: &SpanId,
+    source: Option<&SpanRecord>,
+    target: Option<&SpanRecord>,
+) -> (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    bool,
+    Option<String>,
+) {
+    let name = source
+        .or(target)
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+    let source_status = source.map(|s| s.status);
+    let target_status = target.map(|s| s.status);
+    let status_change = match (source_status, target_status) {
+        (Some(s), Some(t)) if s != t => Some(format!("{:?} -> {:?}", s, t)),
+        (None, Some(t)) => Some(format!("New ({:?})", t)),
+        (Some(s), None) => Some(format!("Removed ({:?})", s)),
+        _ => None,
+    };
+    let duration_ms_delta = match (
+        source.and_then(|s| s.ended_at.map(|e| e.saturating_sub(s.started_at))),
+        target.and_then(|s| s.ended_at.map(|e| e.saturating_sub(s.started_at))),
+    ) {
+        (Some(a), Some(b)) => Some(b as i64 - a as i64),
+        _ => None,
+    };
+    let output_changed = source.and_then(|s| s.output_fingerprint.as_deref())
+        != target.and_then(|s| s.output_fingerprint.as_deref());
+    let dirty_reason = match (source, target) {
+        (None, Some(_)) => Some("new_span".to_owned()),
+        (Some(_), None) => Some("removed_span".to_owned()),
+        (Some(s), Some(t)) => {
+            if s.input_fingerprint != t.input_fingerprint {
+                Some("fingerprint_changed".to_owned())
+            } else if s.output_fingerprint != t.output_fingerprint {
+                Some("upstream_output_changed".to_owned())
+            } else {
+                Some("status_changed".to_owned())
+            }
+        }
+        _ => None,
+    };
+    (
+        span_id.0.clone(),
+        name,
+        status_change,
+        duration_ms_delta,
+        output_changed,
+        dirty_reason,
+    )
 }
 
 fn spans_differ(

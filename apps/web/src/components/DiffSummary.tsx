@@ -67,20 +67,25 @@ export function DiffSummaryPanel({ diff, onJumpToSpan }: DiffSummaryProps) {
         </div>
       </div>
 
-      {/* First divergence */}
-      <div className="diff-panel__divergence">
-        <h4>First Divergent Span</h4>
+      {/* First divergence - prominent CTA */}
+      {diff.first_divergent_span_id && (
         <button
-          className="diff-panel__divergence-link"
+          className="diff-panel__divergence-cta"
           onClick={() => onJumpToSpan(diff.first_divergent_span_id)}
         >
-          {diff.first_divergent_span_id}
+          <span>{'\u2192'}</span>
+          Jump to first divergent span: <strong>{diff.first_divergent_span_id}</strong>
         </button>
-      </div>
+      )}
 
       {/* Span-by-span diffs */}
       <div className="diff-panel__spans">
         <h4>Span Diffs ({diff.span_diffs.length})</h4>
+        {diff.span_diffs.length === 0 && diff.changed_span_count > 0 && (
+          <div className="diff-panel__summary-only">
+            Fingerprint comparison only — detailed span diffs not available
+          </div>
+        )}
         <table className="diff-table">
           <thead>
             <tr>

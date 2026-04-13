@@ -6,7 +6,9 @@ import { SpanInspector } from '../components/SpanInspector';
 import { DiffSummaryPanel } from '../components/DiffSummary';
 import { ArtifactViewer } from '../components/ArtifactViewer';
 import { BranchDraft } from '../components/BranchDraft';
-import { RUN_LIST, SPANS_RUN01, ARTIFACTS_RUN01, EDGES_RUN01, DIFF_01_02, buildTree, BRANCHES } from '../data/mock-data';
+import { TimelineView } from '../components/TimelineView';
+import { FailureNav } from '../components/FailureNav';
+import { RUN_LIST, SPANS_RUN01, ARTIFACTS_RUN01, EDGES_RUN01, DIFF_01_02, buildTree, BRANCHES, getTimelineForRun, getForensicsForRun } from '../data/mock-data';
 
 describe('RunList', () => {
   it('renders all runs', () => {
@@ -248,5 +250,98 @@ describe('BranchDraft', () => {
         onCancel={vi.fn()} onSubmit={vi.fn()} onViewDiff={vi.fn()} />
     );
     expect(screen.getByText('Create Branch')).toBeDisabled();
+  });
+});
+
+describe('TimelineView', () => {
+  it('renders loading state', () => {
+    render(<TimelineView timeline={null} selectedSpanId={null} loading={true} onSelectSpan={vi.fn()} />);
+    expect(screen.getByText(/Loading timeline/)).toBeInTheDocument();
+  });
+
+  it('renders empty state when no timeline', () => {
+    render(<TimelineView timeline={null} selectedSpanId={null} loading={false} onSelectSpan={vi.fn()} />);
+    expect(screen.getByText(/Select a run/)).toBeInTheDocument();
+  });
+
+  it('renders all timeline entries for run_01', () => {
+    const timeline = getTimelineForRun('run_01')!;
+    render(<TimelineView timeline={timeline} selectedSpanId={null} loading={false} onSelectSpan={vi.fn()} />);
+    // Should render entries for all spans in the run
+    expect(timeline.entries.length).toBeGreaterThan(0);
+    // Check at least one known span name is rendered
+    expect(screen.getByText('Analyze issue')).toBeInTheDocument();
+  });
+
+  it('highlights selected span', () => {
+    const timeline = getTimelineForRun('run_01')!;
+    const firstSpan = timeline.entries[0].span_id;
+    const { container } = render(
+      <TimelineView timeline={timeline} selectedSpanId={firstSpan} loading={false} onSelectSpan={vi.fn()} />
+    );
+    const selected = container.querySelector('.timeline-entry--selected');
+    expect(selected).not.toBeNull();
+  });
+
+  it('calls onSelectSpan when entry clicked', () => {
+    const timeline = getTimelineForRun('run_01')!;
+    const onSelect = vi.fn();
+    render(<TimelineView timeline={timeline} selectedSpanId={null} loading={false} onSelectSpan={onSelect} />);
+    const entries = document.querySelectorAll('.timeline-entry');
+    if (entries.length > 0) {
+      fireEvent.click(entries[0]);
+      expect(onSelect).toHaveBeenCalled();
+    }
+  });
+});
+
+describe('FailureNav with forensics', () => {
+  it('uses forensics data when available', () => {
+    const tree = buildTree(SPANS_RUN01);
+    const forensics = getForensicsForRun('run_01')!;
+    const onJump = vi.fn();
+    render(<FailureNav tree={tree} edges={EDGES_RUN01} forensics={forensics} onJumpToSpan={onJump} />);
+    expect(screen.getByTestId('failure-nav')).toBeInTheDocument();
+    // Should show "Jump to deepest failure" from forensics
+    expect(screen.getByText(/Jump to deepest failure/)).toBeInTheDocument();
+  });
+
+  it('shows failure path from forensics', () => {
+    const tree = buildTree(SPANS_RUN01);
+    const forensics = getForensicsForRun('run_01')!;
+    render(<FailureNav tree={tree} edges={EDGES_RUN01} forensics={forensics} onJumpToSpan={vi.fn()} />);
+    if (forensics.failure_path.length > 0) {
+      expect(screen.getByText(/Failure path/)).toBeInTheDocument();
+    }
+  });
+
+  it('shows blocked spans from forensics', () => {
+    const tree = buildTree(SPANS_RUN01);
+    const forensics = getForensicsForRun('run_01')!;
+    render(<FailureNav tree={tree} edges={EDGES_RUN01} forensics={forensics} onJumpToSpan={vi.fn()} />);
+    if (forensics.blocked_spans.length > 0) {
+      expect(screen.getByText(/Blocked spans/)).toBeInTheDocument();
+    }
+  });
+
+  it('falls back to client-side when forensics is null', () => {
+    const tree = buildTree(SPANS_RUN01);
+    render(<FailureNav tree={tree} edges={EDGES_RUN01} forensics={null} onJumpToSpan={vi.fn()} />);
+    expect(screen.getByTestId('failure-nav')).toBeInTheDocument();
+    // Should show the client-side "Jump to first failure" text
+    expect(screen.getByText(/Jump to first failure/)).toBeInTheDocument();
+  });
+
+  it('returns null for successful run without forensics', () => {
+    const successSpan = {
+      ...SPANS_RUN01[0],
+      span_id: 'ok_root',
+      status: 'Completed' as const,
+    };
+    const tree = { span: successSpan, children: [], depth: 0 };
+    const { container } = render(
+      <FailureNav tree={tree} edges={[]} forensics={null} onJumpToSpan={vi.fn()} />
+    );
+    expect(container.querySelector('.failure-nav')).toBeNull();
   });
 });

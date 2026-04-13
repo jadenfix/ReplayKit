@@ -92,4 +92,42 @@ describe('MockProvider', () => {
     const dirty = findDirty(tree!);
     expect(dirty.length).toBeGreaterThan(0);
   });
+
+  it('returns timeline for run_01', async () => {
+    const timeline = await provider.getTimeline('run_01');
+    expect(timeline).not.toBeNull();
+    expect(timeline!.run_id).toBe('run_01');
+    expect(timeline!.entries.length).toBeGreaterThan(0);
+    // Entries should be sorted by started_at
+    for (let i = 1; i < timeline!.entries.length; i++) {
+      expect(timeline!.entries[i].started_at).toBeGreaterThanOrEqual(timeline!.entries[i - 1].started_at);
+    }
+  });
+
+  it('returns null timeline for unknown run', async () => {
+    const timeline = await provider.getTimeline('nonexistent');
+    expect(timeline).toBeNull();
+  });
+
+  it('returns forensics for failed run', async () => {
+    const forensics = await provider.getForensics('run_01');
+    expect(forensics).not.toBeNull();
+    expect(forensics!.has_failure).toBe(true);
+    expect(forensics!.first_failed_span_id).toBeTruthy();
+    expect(forensics!.deepest_failed_span_id).toBeTruthy();
+    expect(forensics!.failure_path.length).toBeGreaterThan(0);
+  });
+
+  it('returns forensics without failures for successful run', async () => {
+    const forensics = await provider.getForensics('run_03');
+    expect(forensics).not.toBeNull();
+    expect(forensics!.has_failure).toBe(false);
+    expect(forensics!.first_failed_span_id).toBeNull();
+    expect(forensics!.failure_path).toHaveLength(0);
+  });
+
+  it('returns null forensics for unknown run', async () => {
+    const forensics = await provider.getForensics('nonexistent');
+    expect(forensics).toBeNull();
+  });
 });

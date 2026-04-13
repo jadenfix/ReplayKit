@@ -9,9 +9,9 @@ use replaykit_collector::{
     ArtifactSpec, BeginRun, Collector, EdgeSpec, EndSpan, EventSpec, SnapshotSpec, SpanSpec,
 };
 use replaykit_core_model::{
-    ArtifactId, ArtifactRecord, BranchPlan, BranchRecord, BranchRequest, ReplayJobId,
+    ArtifactId, ArtifactRecord, BranchPlan, BranchRecord, BranchRequest, EdgeKind, ReplayJobId,
     ReplayJobRecord, RunDiffRecord, RunId, RunRecord, RunTreeNode, SpanEdgeRecord, SpanId,
-    SpanRecord,
+    SpanRecord, SpanStatus,
 };
 use replaykit_diff_engine::DiffEngine;
 use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine};
@@ -187,8 +187,97 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
             .collect())
     }
 
+    pub fn run_timeline(&self, run_id: &RunId) -> Result<Vec<(SpanRecord, usize)>, ApiError> {
+        let mut spans = self.storage.list_spans(run_id)?;
+        spans.sort_by_key(|s| s.started_at);
+
+        let mut depth_map = BTreeMap::<SpanId, usize>::new();
+        // Two passes to handle children appearing before parents in time order
+        for span in &spans {
+            let depth = match &span.parent_span_id {
+                None => 0,
+                Some(pid) => depth_map.get(pid).map_or(0, |d| d + 1),
+            };
+            depth_map.insert(span.span_id.clone(), depth);
+        }
+        for span in &spans {
+            if let Some(pid) = &span.parent_span_id
+                && let Some(&parent_depth) = depth_map.get(pid)
+            {
+                depth_map.insert(span.span_id.clone(), parent_depth + 1);
+            }
+        }
+
+        Ok(spans
+            .into_iter()
+            .map(|span| {
+                let depth = depth_map.get(&span.span_id).copied().unwrap_or(0);
+                (span, depth)
+            })
+            .collect())
+    }
+
     pub fn list_edges(&self, run_id: &RunId) -> Result<Vec<SpanEdgeRecord>, ApiError> {
         self.storage.list_edges(run_id).map_err(Into::into)
+    }
+
+    pub fn run_forensics(
+        &self,
+        run_id: &RunId,
+    ) -> Result<views::FailureForensicsView, ApiError> {
+        let run = self.storage.get_run(run_id)?;
+        let spans = self.storage.list_spans(run_id)?;
+        let edges = self.storage.list_edges(run_id)?;
+        let tree = self.run_tree(run_id)?;
+
+        let failed_spans: Vec<&SpanRecord> = spans
+            .iter()
+            .filter(|s| s.status == SpanStatus::Failed)
+            .collect();
+
+        let has_failure = !failed_spans.is_empty();
+
+        let first_failed = failed_spans
+            .iter()
+            .min_by_key(|s| s.started_at)
+            .map(|s| s.span_id.0.clone());
+
+        let deepest_failed = find_deepest_failure(&tree);
+
+        let span_map: BTreeMap<SpanId, &SpanRecord> =
+            spans.iter().map(|s| (s.span_id.clone(), s)).collect();
+
+        let deepest_dep = deepest_failed
+            .as_ref()
+            .and_then(|sid| find_deepest_failing_dep(&SpanId(sid.clone()), &span_map, &edges));
+
+        let failure_path = deepest_failed
+            .as_ref()
+            .map(|sid| build_path_to_root(&SpanId(sid.clone()), &span_map))
+            .unwrap_or_default();
+
+        let blocked_spans: Vec<views::BlockedSpanView> = spans
+            .iter()
+            .filter(|s| s.status == SpanStatus::Blocked)
+            .map(|s| views::BlockedSpanView {
+                span_id: s.span_id.0.clone(),
+                name: s.name.clone(),
+                reason: s.error_summary.clone(),
+            })
+            .collect();
+
+        let retry_groups = build_retry_groups(&spans, &edges);
+
+        Ok(views::FailureForensicsView {
+            run_id: run.run_id.0.clone(),
+            has_failure,
+            first_failed_span_id: first_failed,
+            deepest_failed_span_id: deepest_failed,
+            deepest_failing_dependency_id: deepest_dep,
+            failure_path,
+            blocked_spans,
+            retry_groups,
+        })
     }
 
     pub fn list_run_branches(&self, run_id: &RunId) -> Result<Vec<BranchRecord>, ApiError> {
@@ -266,6 +355,115 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
             .get_cached_diff(source_run_id, target_run_id)
             .map_err(Into::into)
     }
+}
+
+fn find_deepest_failure(nodes: &[RunTreeNode]) -> Option<String> {
+    fn walk(nodes: &[RunTreeNode], depth: usize, best: &mut Option<(usize, String)>) {
+        for node in nodes {
+            if node.span.status == SpanStatus::Failed
+                && best.as_ref().is_none_or(|(d, _)| depth > *d)
+            {
+                *best = Some((depth, node.span.span_id.0.clone()));
+            }
+            walk(&node.children, depth + 1, best);
+        }
+    }
+    let mut best = None;
+    walk(nodes, 0, &mut best);
+    best.map(|(_, id)| id)
+}
+
+fn find_deepest_failing_dep(
+    span_id: &SpanId,
+    span_map: &BTreeMap<SpanId, &SpanRecord>,
+    edges: &[SpanEdgeRecord],
+) -> Option<String> {
+    let deps: Vec<&SpanEdgeRecord> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::DataDependsOn && e.to_span_id == *span_id)
+        .collect();
+
+    for dep in &deps {
+        if let Some(from) = span_map.get(&dep.from_span_id)
+            && from.status == SpanStatus::Failed
+        {
+            return find_deepest_failing_dep(&dep.from_span_id, span_map, edges)
+                .or_else(|| Some(dep.from_span_id.0.clone()));
+        }
+    }
+    None
+}
+
+fn build_path_to_root(target: &SpanId, span_map: &BTreeMap<SpanId, &SpanRecord>) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = Some(target.clone());
+    while let Some(sid) = current {
+        path.push(sid.0.clone());
+        current = span_map.get(&sid).and_then(|s| s.parent_span_id.clone());
+    }
+    path.reverse();
+    path
+}
+
+fn build_retry_groups(
+    spans: &[SpanRecord],
+    edges: &[SpanEdgeRecord],
+) -> Vec<views::RetryGroupView> {
+    let retry_edges: Vec<&SpanEdgeRecord> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::RetryOf)
+        .collect();
+
+    if retry_edges.is_empty() {
+        return Vec::new();
+    }
+
+    let span_map: BTreeMap<SpanId, &SpanRecord> =
+        spans.iter().map(|s| (s.span_id.clone(), s)).collect();
+
+    let mut groups: Vec<std::collections::BTreeSet<SpanId>> = Vec::new();
+    for edge in &retry_edges {
+        let from = &edge.from_span_id;
+        let to = &edge.to_span_id;
+        let mut found = None;
+        for (i, group) in groups.iter().enumerate() {
+            if group.contains(from) || group.contains(to) {
+                found = Some(i);
+                break;
+            }
+        }
+        match found {
+            Some(i) => {
+                groups[i].insert(from.clone());
+                groups[i].insert(to.clone());
+            }
+            None => {
+                let mut g = std::collections::BTreeSet::new();
+                g.insert(from.clone());
+                g.insert(to.clone());
+                groups.push(g);
+            }
+        }
+    }
+
+    groups
+        .into_iter()
+        .filter(|g| g.len() >= 2)
+        .map(|g| {
+            let mut span_ids: Vec<String> = g.iter().map(|id| id.0.clone()).collect();
+            span_ids.sort();
+            let final_span = g
+                .iter()
+                .filter_map(|id| span_map.get(id))
+                .max_by_key(|s| s.started_at);
+            let final_status = final_span.map(|s| s.status).unwrap_or(SpanStatus::Failed);
+            views::RetryGroupView {
+                span_ids,
+                final_status,
+                final_status_label: views::span_status_label(final_status),
+            }
+        })
+        .collect()
 }
 
 fn build_tree(

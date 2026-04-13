@@ -1,9 +1,10 @@
 import { useReducer, useCallback, useEffect, useRef } from 'react';
 import type {
-  AppState, BottomTab, BranchDraftState,
+  AppState, BottomTab, BranchDraftState, CenterView,
   SpanRecord, RunRecord, SpanTreeNode,
   ArtifactRecord, SpanEdgeRecord, BranchRecord,
   DiffSummary, RunListItem, PatchType,
+  TimelineView, ForensicsReport,
 } from '../types';
 import type { ReplayKitProvider } from '../providers';
 
@@ -21,7 +22,10 @@ type Action =
   | { type: 'UPDATE_BRANCH_DRAFT'; draft: Partial<BranchDraftState> }
   | { type: 'CANCEL_BRANCH_DRAFT' }
   | { type: 'BRANCH_CREATED'; branch: BranchRecord }
-  | { type: 'DIFF_LOADED'; diff: DiffSummary | null };
+  | { type: 'DIFF_LOADED'; diff: DiffSummary | null }
+  | { type: 'SET_CENTER_VIEW'; view: CenterView }
+  | { type: 'TIMELINE_LOADED'; timeline: TimelineView | null }
+  | { type: 'FORENSICS_LOADED'; forensics: ForensicsReport | null };
 
 // ── Initial state ───────────────────────────────────────────────────
 
@@ -38,7 +42,10 @@ const INIT: AppState = {
   branches: [],
   bottomTab: 'artifacts',
   branchDraft: null,
-  loading: { runs: true, tree: false, detail: false },
+  centerView: 'tree',
+  timeline: null,
+  forensics: null,
+  loading: { runs: true, tree: false, detail: false, timeline: false },
 };
 
 // ── Reducer ─────────────────────────────────────────────────────────
@@ -57,9 +64,12 @@ function reducer(state: AppState, action: Action): AppState {
         spanDetail: null,
         spanArtifacts: [],
         runTree: null,
+        timeline: null,
+        forensics: null,
         diffSummary: null,
         branchDraft: null,
-        loading: { ...state.loading, tree: true },
+        centerView: 'tree',
+        loading: { ...state.loading, tree: true, timeline: true },
       };
     case 'TREE_LOADED':
       return {
@@ -114,6 +124,12 @@ function reducer(state: AppState, action: Action): AppState {
       };
     case 'DIFF_LOADED':
       return { ...state, diffSummary: action.diff, bottomTab: 'diff' };
+    case 'SET_CENTER_VIEW':
+      return { ...state, centerView: action.view };
+    case 'TIMELINE_LOADED':
+      return { ...state, timeline: action.timeline, loading: { ...state.loading, timeline: false } };
+    case 'FORENSICS_LOADED':
+      return { ...state, forensics: action.forensics };
     default:
       return state;
   }
@@ -159,6 +175,28 @@ export function useAppState(provider: ReplayKitProvider) {
     }).catch(err => {
       console.error('Failed to load run tree:', err);
       dispatch({ type: 'TREE_LOADED', tree: null, run: null, branches: [], edges: [] });
+    });
+  }, [state.selectedRunId]);
+
+  // Load timeline in parallel with tree
+  useEffect(() => {
+    if (!state.selectedRunId) return;
+    const runId = state.selectedRunId;
+    providerRef.current.getTimeline(runId).then(timeline => {
+      dispatch({ type: 'TIMELINE_LOADED', timeline });
+    }).catch(() => {
+      dispatch({ type: 'TIMELINE_LOADED', timeline: null });
+    });
+  }, [state.selectedRunId]);
+
+  // Load forensics in parallel with tree
+  useEffect(() => {
+    if (!state.selectedRunId) return;
+    const runId = state.selectedRunId;
+    providerRef.current.getForensics(runId).then(forensics => {
+      dispatch({ type: 'FORENSICS_LOADED', forensics });
+    }).catch(() => {
+      dispatch({ type: 'FORENSICS_LOADED', forensics: null });
     });
   }, [state.selectedRunId]);
 
@@ -218,6 +256,10 @@ export function useAppState(provider: ReplayKitProvider) {
     dispatch({ type: 'SELECT_SPAN', spanId });
   }, []);
 
+  const setCenterView = useCallback((view: CenterView) => {
+    dispatch({ type: 'SET_CENTER_VIEW', view });
+  }, []);
+
   return {
     state,
     selectRun,
@@ -229,5 +271,6 @@ export function useAppState(provider: ReplayKitProvider) {
     submitBranch,
     loadDiff,
     jumpToSpan,
+    setCenterView,
   };
 }

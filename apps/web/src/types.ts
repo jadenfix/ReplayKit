@@ -159,6 +159,55 @@ export interface SpanDiff {
   dirty_reason: DirtyReason | null;
 }
 
+// ── Timeline ───────────────────────────────────────────────────────
+
+export interface TimelineView {
+  run_id: string;
+  title: string;
+  status: RunStatus;
+  total_started_at: number;
+  total_ended_at: number | null;
+  entries: TimelineEntryView[];
+}
+
+export interface TimelineEntryView {
+  span_id: string;
+  name: string;
+  kind: SpanKind;
+  status: SpanStatus;
+  status_label: string;
+  started_at: number;
+  ended_at: number | null;
+  depth: number;
+  parent_span_id: string | null;
+  error_summary: string | null;
+}
+
+// ── Forensics ──────────────────────────────────────────────────────
+
+export interface ForensicsReport {
+  run_id: string;
+  has_failure: boolean;
+  first_failed_span_id: string | null;
+  deepest_failed_span_id: string | null;
+  deepest_failing_dependency_id: string | null;
+  failure_path: string[];
+  blocked_spans: ForensicsBlockedSpan[];
+  retry_groups: ForensicsRetryGroup[];
+}
+
+export interface ForensicsBlockedSpan {
+  span_id: string;
+  name: string;
+  reason: string | null;
+}
+
+export interface ForensicsRetryGroup {
+  span_ids: string[];
+  final_status: SpanStatus;
+  final_status_label: string;
+}
+
 // ── Branch Draft ────────────────────────────────────────────────────
 
 export interface BranchDraftState {
@@ -173,6 +222,7 @@ export interface BranchDraftState {
 // ── App State ───────────────────────────────────────────────────────
 
 export type BottomTab = 'artifacts' | 'diff' | 'branch';
+export type CenterView = 'tree' | 'timeline';
 
 export interface AppState {
   runs: RunListItem[];
@@ -187,5 +237,8 @@ export interface AppState {
   branches: BranchRecord[];
   bottomTab: BottomTab;
   branchDraft: BranchDraftState | null;
-  loading: { runs: boolean; tree: boolean; detail: boolean };
+  centerView: CenterView;
+  timeline: TimelineView | null;
+  forensics: ForensicsReport | null;
+  loading: { runs: boolean; tree: boolean; detail: boolean; timeline: boolean };
 }
