@@ -142,7 +142,7 @@ impl InMemoryStorage {
         run_id: &RunId,
         artifact_id: &ArtifactId,
     ) -> Result<ArtifactRecord, StorageError> {
-        state
+        let artifact = state
             .artifacts
             .get(run_id)
             .and_then(|artifacts| artifacts.get(artifact_id))
@@ -152,7 +152,9 @@ impl InMemoryStorage {
                     "artifact {:?} for run {:?} not found",
                     artifact_id.0, run_id.0
                 ))
-            })
+            })?;
+        validate_artifact_record(&artifact)?;
+        Ok(artifact)
     }
 
     fn ensure_artifact_attached_to_span(
@@ -172,6 +174,78 @@ impl InMemoryStorage {
             ))),
         }
     }
+}
+
+fn validate_artifact_record(artifact: &ArtifactRecord) -> Result<(), StorageError> {
+    if artifact.mime.trim().is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} has an empty mime type",
+            artifact.artifact_id.0
+        )));
+    }
+    if artifact.sha256.trim().is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} has an empty sha256",
+            artifact.artifact_id.0
+        )));
+    }
+    if artifact.blob_path.trim().is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} has an empty blob_path",
+            artifact.artifact_id.0
+        )));
+    }
+
+    let Some(blob_path) = local_blob_path(&artifact.blob_path) else {
+        return Ok(());
+    };
+
+    let metadata = fs::metadata(&blob_path).map_err(|err| {
+        StorageError::InvalidInput(format!(
+            "artifact {:?} references unreadable blob {:?}: {err}",
+            artifact.artifact_id.0, blob_path
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} references blob {:?}, which is not a regular file",
+            artifact.artifact_id.0, blob_path
+        )));
+    }
+    if metadata.len() != artifact.byte_len as u64 {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} expected blob {:?} to be {} bytes but found {}",
+            artifact.artifact_id.0,
+            blob_path,
+            artifact.byte_len,
+            metadata.len()
+        )));
+    }
+    if !looks_like_sha256(&artifact.sha256) {
+        return Err(StorageError::InvalidInput(format!(
+            "artifact {:?} uses local blob {:?} but sha256 is not a 64-character hex digest",
+            artifact.artifact_id.0, blob_path
+        )));
+    }
+
+    Ok(())
+}
+
+fn local_blob_path(blob_path: &str) -> Option<PathBuf> {
+    if blob_path.starts_with("memory://") {
+        return None;
+    }
+    if let Some(path) = blob_path.strip_prefix("file://") {
+        return Some(PathBuf::from(path));
+    }
+    if blob_path.contains("://") {
+        return None;
+    }
+    Some(PathBuf::from(blob_path))
+}
+
+fn looks_like_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl Storage for InMemoryStorage {
@@ -340,6 +414,7 @@ impl Storage for InMemoryStorage {
         if let Some(span_id) = &artifact.span_id {
             Self::ensure_span_exists(&state, &artifact.run_id, span_id)?;
         }
+        validate_artifact_record(&artifact)?;
         if state
             .artifacts
             .get(&artifact.run_id)
@@ -367,7 +442,7 @@ impl Storage for InMemoryStorage {
         let state = self.state.read().map_err(|_| {
             StorageError::Internal("failed to lock storage for artifact read".into())
         })?;
-        state
+        let artifact = state
             .artifacts
             .get(run_id)
             .and_then(|records| records.get(artifact_id))
@@ -377,7 +452,9 @@ impl Storage for InMemoryStorage {
                     "artifact {:?} for run {:?} not found",
                     artifact_id.0, run_id.0
                 ))
-            })
+            })?;
+        validate_artifact_record(&artifact)?;
+        Ok(artifact)
     }
 
     fn list_artifacts(&self, run_id: &RunId) -> Result<Vec<ArtifactRecord>, StorageError> {
@@ -389,6 +466,9 @@ impl Storage for InMemoryStorage {
             .get(run_id)
             .map(|records| records.values().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        for artifact in &artifacts {
+            validate_artifact_record(artifact)?;
+        }
         artifacts.sort_by_key(|artifact| artifact.created_at);
         Ok(artifacts)
     }
@@ -830,7 +910,9 @@ impl SqliteStorage {
                     artifact_id.0, run_id.0
                 ))
             })?;
-        decode_json(&payload)
+        let artifact = decode_json(&payload)?;
+        validate_artifact_record(&artifact)?;
+        Ok(artifact)
     }
 }
 
@@ -1186,6 +1268,7 @@ impl Storage for SqliteStorage {
             if let Some(span_id) = &artifact.span_id {
                 Self::ensure_span_exists_conn(conn, &artifact.run_id, span_id)?;
             }
+            validate_artifact_record(&artifact)?;
             conn.execute(
                 "INSERT INTO artifacts(run_id, artifact_id, created_at, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1221,7 +1304,9 @@ impl Storage for SqliteStorage {
                         artifact_id.0, run_id.0
                     ))
                 })?;
-            decode_json(&payload)
+            let artifact = decode_json(&payload)?;
+            validate_artifact_record(&artifact)?;
+            Ok(artifact)
         })
     }
 
@@ -1237,7 +1322,11 @@ impl Storage for SqliteStorage {
             let rows = stmt
                 .query_map(params![run_id.0], |row| row.get::<_, String>(0))
                 .map_err(map_sqlite_error)?;
-            collect_json_rows(rows)
+            let artifacts = collect_json_rows(rows)?;
+            for artifact in &artifacts {
+                validate_artifact_record(artifact)?;
+            }
+            Ok(artifacts)
         })
     }
 
@@ -1803,11 +1892,110 @@ mod tests {
         let _ = fs::remove_file(db_path);
     }
 
+    #[test]
+    fn in_memory_storage_rejects_missing_local_blob_file() {
+        let storage = InMemoryStorage::new();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let missing_path = unique_blob_path("missing-local-blob.txt");
+        let err = storage
+            .insert_artifact(ArtifactRecord {
+                artifact_id: ArtifactId("artifact-local-missing".into()),
+                run_id: run.run_id.clone(),
+                span_id: None,
+                artifact_type: ArtifactType::FileBlob,
+                mime: "application/octet-stream".into(),
+                sha256: "a".repeat(64),
+                byte_len: 4,
+                blob_path: missing_path.display().to_string(),
+                summary: BTreeMap::new(),
+                redaction: BTreeMap::new(),
+                created_at: 1,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn sqlite_storage_rejects_local_blob_with_wrong_size() {
+        let db_path = unique_db_path("local-blob-size");
+        let blob_path = unique_blob_path("local-blob-size.bin");
+        fs::write(&blob_path, b"blob").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let err = storage
+            .insert_artifact(ArtifactRecord {
+                artifact_id: ArtifactId("artifact-wrong-size".into()),
+                run_id: run.run_id.clone(),
+                span_id: None,
+                artifact_type: ArtifactType::FileBlob,
+                mime: "application/octet-stream".into(),
+                sha256: "b".repeat(64),
+                byte_len: 99,
+                blob_path: blob_path.display().to_string(),
+                summary: BTreeMap::new(),
+                redaction: BTreeMap::new(),
+                created_at: 1,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+        let _ = fs::remove_file(blob_path);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn sqlite_storage_detects_deleted_local_blob_on_read() {
+        let db_path = unique_db_path("deleted-local-blob");
+        let blob_path = unique_blob_path("deleted-local-blob.bin");
+        fs::write(&blob_path, b"blob").unwrap();
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-local-read".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::FileBlob,
+            mime: "application/octet-stream".into(),
+            sha256: "c".repeat(64),
+            byte_len: 4,
+            blob_path: blob_path.display().to_string(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        storage.insert_artifact(artifact.clone()).unwrap();
+
+        fs::remove_file(&blob_path).unwrap();
+
+        let err = storage
+            .get_artifact(&run.run_id, &artifact.artifact_id)
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+
+        let _ = fs::remove_file(db_path);
+    }
+
     fn unique_db_path(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("replaykit-{label}-{nonce}.db"))
+    }
+
+    fn unique_blob_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("replaykit-blob-{label}-{nonce}"))
     }
 }

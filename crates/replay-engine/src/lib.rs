@@ -5,8 +5,8 @@ use std::sync::Arc;
 use replaykit_core_model::{
     ArtifactId, ArtifactRecord, ArtifactType, BranchId, BranchPlan, BranchRecord, BranchRequest,
     CostMetrics, DirtyReason, DirtySpanRecord, Document, EdgeKind, IdKind, PatchType, ReplayJobId,
-    ReplayJobRecord, ReplayJobStatus, ReplayMode, RunId, RunRecord, RunStatus, SnapshotId,
-    SnapshotRecord, SpanEdgeRecord, SpanId, SpanRecord, SpanStatus, Value,
+    ReplayJobRecord, ReplayJobStatus, ReplayMode, RunId, RunRecord, RunStatus, RunSummary,
+    SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanRecord, SpanStatus, Value,
 };
 use replaykit_storage::{Storage, StorageError};
 
@@ -353,9 +353,9 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
         } else {
             RunStatus::Completed
         };
-        target_run.summary.span_count = final_spans.len() as u64;
-        target_run.summary.artifact_count =
-            self.storage.list_artifacts(&target_run_id)?.len() as u64;
+        let final_artifacts = self.storage.list_artifacts(&target_run_id)?;
+        target_run.summary =
+            RunSummary::from_run_state(target_run.status, &final_spans, &final_artifacts, None);
         self.storage.update_run(target_run.clone())?;
 
         let mut branch = self.storage.get_branch(&branch_id)?;
@@ -1038,6 +1038,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(execution.target_run.status, RunStatus::Blocked);
+        assert_eq!(execution.target_run.summary.error_count, 1);
+        assert_eq!(
+            execution.target_run.summary.failure_class,
+            Some(replaykit_core_model::FailureClass::ReplayUnsupported)
+        );
+        assert_eq!(execution.target_run.summary.token_count, 0);
+        assert_eq!(execution.target_run.summary.artifact_count, 3);
+        assert_eq!(execution.target_run.summary.final_output_preview, None);
         let answer = storage
             .get_span(&execution.target_run.run_id, &SpanId("answer".into()))
             .unwrap();
@@ -1071,6 +1079,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(execution.target_run.status, RunStatus::Completed);
+        assert_eq!(execution.target_run.summary.error_count, 0);
+        assert_eq!(execution.target_run.summary.failure_class, None);
+        assert_eq!(execution.target_run.summary.token_count, 8);
+        assert_eq!(execution.target_run.summary.estimated_cost_micros, 11);
+        assert_eq!(execution.target_run.summary.artifact_count, 5);
+        assert_eq!(execution.target_run.summary.final_output_preview, None);
         let answer = storage
             .get_span(&execution.target_run.run_id, &SpanId("answer".into()))
             .unwrap();

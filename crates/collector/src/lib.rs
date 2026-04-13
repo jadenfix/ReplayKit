@@ -5,8 +5,8 @@ use std::sync::Arc;
 use replaykit_core_model::{
     ArtifactId, ArtifactRecord, ArtifactType, BranchRequest, CostMetrics, Document, EdgeId,
     EdgeKind, EventId, EventRecord, HostMetadata, IdKind, PatchType, ReplayPolicy, RunId,
-    RunRecord, RunStatus, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanKind, SpanRecord,
-    SpanStatus, TraceId, Value,
+    RunRecord, RunStatus, RunSummary, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanKind,
+    SpanRecord, SpanStatus, TraceId, Value,
 };
 use replaykit_storage::{Storage, StorageError};
 
@@ -382,11 +382,11 @@ impl<S: Storage> Collector<S> {
                 run_id.0
             )));
         }
+        let artifacts = self.storage.list_artifacts(run_id)?;
+        let preview = final_output_preview.or_else(|| run.summary.final_output_preview.clone());
         run.ended_at = Some(ended_at);
         run.status = status;
-        run.summary.span_count = spans.len() as u64;
-        run.summary.artifact_count = self.storage.list_artifacts(run_id)?.len() as u64;
-        run.summary.final_output_preview = final_output_preview;
+        run.summary = RunSummary::from_run_state(status, &spans, &artifacts, preview);
         self.storage.update_run(run.clone())?;
         Ok(run)
     }
@@ -398,11 +398,18 @@ impl<S: Storage> Collector<S> {
         error: impl Into<String>,
     ) -> Result<RunRecord, CollectorError> {
         let mut run = self.storage.get_run(run_id)?;
+        if ended_at < run.started_at {
+            return Err(CollectorError::InvalidInput(format!(
+                "run {:?} cannot end before it started",
+                run_id.0
+            )));
+        }
+        let spans = self.storage.list_spans(run_id)?;
+        let artifacts = self.storage.list_artifacts(run_id)?;
+        let error = error.into();
         run.ended_at = Some(ended_at);
         run.status = RunStatus::Interrupted;
-        run.summary.error_count += 1;
-        run.summary.failure_class = Some(replaykit_core_model::FailureClass::Unknown);
-        run.summary.final_output_preview = Some(error.into());
+        run.summary = RunSummary::from_run_state(run.status, &spans, &artifacts, Some(error));
         self.storage.update_run(run.clone())?;
         Ok(run)
     }
@@ -568,7 +575,8 @@ mod tests {
     use std::sync::Arc;
 
     use replaykit_core_model::{
-        ArtifactId, ArtifactType, HostMetadata, ReplayPolicy, RunStatus, SpanKind, SpanStatus,
+        ArtifactId, ArtifactType, FailureClass, HostMetadata, ReplayPolicy, RunStatus, SpanKind,
+        SpanStatus,
     };
     use replaykit_storage::InMemoryStorage;
 
@@ -830,5 +838,149 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, CollectorError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn finish_run_recomputes_summary_from_persisted_state() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+
+        let completed = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("planner".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::PlannerStep,
+                    name: "planner".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RecordOnly,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        collector
+            .end_span(
+                &run.run_id,
+                &completed.span_id,
+                EndSpan {
+                    ended_at: 3,
+                    status: SpanStatus::Completed,
+                    output_artifact_ids: Vec::new(),
+                    snapshot_id: None,
+                    output_fingerprint: Some("planner-out".into()),
+                    error_code: None,
+                    error_summary: None,
+                    cost: CostMetrics {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        estimated_cost_micros: 7,
+                    },
+                },
+            )
+            .unwrap();
+
+        let failed = collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("tool".into())),
+                    parent_span_id: Some(completed.span_id.clone()),
+                    kind: SpanKind::ToolCall,
+                    name: "tool".into(),
+                    started_at: 4,
+                    replay_policy: ReplayPolicy::RerunnableSupported,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+        collector
+            .end_span(
+                &run.run_id,
+                &failed.span_id,
+                EndSpan {
+                    ended_at: 5,
+                    status: SpanStatus::Failed,
+                    output_artifact_ids: Vec::new(),
+                    snapshot_id: None,
+                    output_fingerprint: None,
+                    error_code: Some("tool_error".into()),
+                    error_summary: Some("tool failed".into()),
+                    cost: CostMetrics {
+                        input_tokens: 11,
+                        output_tokens: 13,
+                        estimated_cost_micros: 17,
+                    },
+                },
+            )
+            .unwrap();
+
+        let finished = collector
+            .finish_run(&run.run_id, 6, RunStatus::Failed, Some("failed".into()))
+            .unwrap();
+
+        assert_eq!(finished.summary.span_count, 2);
+        assert_eq!(finished.summary.artifact_count, 0);
+        assert_eq!(finished.summary.error_count, 1);
+        assert_eq!(finished.summary.token_count, 32);
+        assert_eq!(finished.summary.estimated_cost_micros, 24);
+        assert_eq!(
+            finished.summary.failure_class,
+            Some(FailureClass::ToolFailure)
+        );
+        assert_eq!(
+            finished.summary.final_output_preview.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn abort_run_recomputes_summary_for_interrupted_runs() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let collector = Collector::new(storage);
+        let run = collector.begin_run(sample_begin_run()).unwrap();
+
+        collector
+            .start_span(
+                &run.run_id,
+                &run.trace_id,
+                SpanSpec {
+                    span_id: Some(SpanId("planner".into())),
+                    parent_span_id: None,
+                    kind: SpanKind::PlannerStep,
+                    name: "planner".into(),
+                    started_at: 2,
+                    replay_policy: ReplayPolicy::RecordOnly,
+                    executor_kind: None,
+                    executor_version: None,
+                    input_artifact_ids: Vec::new(),
+                    input_fingerprint: None,
+                    environment_fingerprint: None,
+                    attributes: Document::new(),
+                },
+            )
+            .unwrap();
+
+        let aborted = collector.abort_run(&run.run_id, 3, "interrupted").unwrap();
+        assert_eq!(aborted.status, RunStatus::Interrupted);
+        assert_eq!(aborted.summary.error_count, 1);
+        assert_eq!(aborted.summary.failure_class, Some(FailureClass::Unknown));
+        assert_eq!(
+            aborted.summary.final_output_preview.as_deref(),
+            Some("interrupted")
+        );
     }
 }
