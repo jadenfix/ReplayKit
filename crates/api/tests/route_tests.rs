@@ -142,6 +142,7 @@ fn seed_run<S: Storage, E: ExecutorRegistry>(
                 summary: Document::new(),
                 redaction: Document::new(),
                 created_at: 4,
+                content: None,
             },
         )
         .unwrap();
@@ -195,6 +196,7 @@ fn seed_run<S: Storage, E: ExecutorRegistry>(
                 summary: Document::new(),
                 redaction: Document::new(),
                 created_at: 6,
+                content: None,
             },
         )
         .unwrap();
@@ -233,13 +235,18 @@ fn seed_run<S: Storage, E: ExecutorRegistry>(
 }
 
 fn seeded_server() -> (TestServer, RunId) {
+    let (server, run_id, _) = seeded_server_with_storage();
+    (server, run_id)
+}
+
+fn seeded_server_with_storage() -> (TestServer, RunId, Arc<InMemoryStorage>) {
     let storage = Arc::new(InMemoryStorage::new());
     let service = Arc::new(ReplayKitService::new(storage.clone(), FakeExecutorRegistry));
     let run = seed_run(&service);
     let run_id = run.run_id.clone();
     let router = build_router(service);
     let server = TestServer::new(router).expect("test server");
-    (server, run_id)
+    (server, run_id, storage)
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +296,17 @@ async fn run_tree_returns_200_with_nodes() {
     assert_eq!(nodes.len(), 1); // root: planner
     assert_eq!(nodes[0]["name"], "planner");
     assert_eq!(nodes[0]["children"].as_array().unwrap().len(), 2); // tool + answer
+}
+
+#[tokio::test]
+async fn run_edges_returns_200() {
+    let (server, run_id) = seeded_server();
+    let resp = server.get(&format!("/api/v1/runs/{}/edges", run_id.0)).await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert!(body.is_array());
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["kind"], "DataDependsOn");
 }
 
 #[tokio::test]
@@ -377,6 +395,65 @@ async fn cached_diff_returns_200_after_branch() {
     assert_eq!(body["source_run_id"], run_id.0);
     assert_eq!(body["target_run_id"], target_run_id);
     assert!(body["changed_span_count"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn run_branches_returns_200_after_branch() {
+    let (server, run_id) = seeded_server();
+    let branch_resp = server
+        .post("/api/v1/branches")
+        .json(&serde_json::json!({
+            "source_run_id": run_id.0,
+            "fork_span_id": "tool",
+            "patch_type": "tool_output_override",
+            "replacement": "patched"
+        }))
+        .await;
+    let branch: serde_json::Value = branch_resp.json();
+    let target_run_id = branch["target_run_id"].as_str().unwrap();
+
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/branches", run_id.0))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert!(body.is_array());
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(body[0]["source_run_id"], run_id.0);
+    assert_eq!(body[0]["target_run_id"], target_run_id);
+    assert_eq!(body[0]["fork_span_id"], "tool");
+}
+
+#[tokio::test]
+async fn artifact_content_returns_200_for_stored_blob() {
+    let (server, run_id, storage) = seeded_server_with_storage();
+    let artifact = replaykit_core_model::ArtifactRecord {
+        artifact_id: replaykit_core_model::ArtifactId("blob-artifact".into()),
+        run_id: run_id.clone(),
+        span_id: None,
+        artifact_type: ArtifactType::DebugLog,
+        mime: "application/json".into(),
+        sha256: "placeholder".into(),
+        byte_len: 0,
+        blob_path: "memory://placeholder".into(),
+        summary: Document::new(),
+        redaction: Document::new(),
+        created_at: 9,
+    };
+    storage
+        .store_artifact_with_content(artifact, br#"{"ok":true}"#)
+        .unwrap();
+
+    let resp = server
+        .get(&format!(
+            "/api/v1/runs/{}/artifacts/{}/content",
+            run_id.0, "blob-artifact"
+        ))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["artifact_id"], "blob-artifact");
+    assert_eq!(body["content"], "{\"ok\":true}");
 }
 
 #[tokio::test]
@@ -492,6 +569,7 @@ async fn run_tree_golden_shape() {
         "kind",
         "status",
         "status_label",
+        "replay_policy",
         "started_at",
         "ended_at",
         "error_summary",

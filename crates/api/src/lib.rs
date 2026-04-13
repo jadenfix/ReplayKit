@@ -9,8 +9,9 @@ use replaykit_collector::{
     ArtifactSpec, BeginRun, Collector, EdgeSpec, EndSpan, EventSpec, SnapshotSpec, SpanSpec,
 };
 use replaykit_core_model::{
-    ArtifactRecord, BranchPlan, BranchRequest, ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId,
-    RunRecord, RunTreeNode, SpanEdgeRecord, SpanId, SpanRecord,
+    ArtifactId, ArtifactRecord, BranchPlan, BranchRecord, BranchRequest, ReplayJobId,
+    ReplayJobRecord, RunDiffRecord, RunId, RunRecord, RunTreeNode, SpanEdgeRecord, SpanId,
+    SpanRecord,
 };
 use replaykit_diff_engine::DiffEngine;
 use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine};
@@ -184,6 +185,37 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
             .into_iter()
             .filter(|e| e.from_span_id == *span_id || e.to_span_id == *span_id)
             .collect())
+    }
+
+    pub fn list_edges(&self, run_id: &RunId) -> Result<Vec<SpanEdgeRecord>, ApiError> {
+        self.storage.list_edges(run_id).map_err(Into::into)
+    }
+
+    pub fn list_run_branches(&self, run_id: &RunId) -> Result<Vec<BranchRecord>, ApiError> {
+        Ok(self
+            .storage
+            .list_branches()?
+            .into_iter()
+            .filter(|branch| branch.source_run_id == *run_id || branch.target_run_id == *run_id)
+            .collect())
+    }
+
+    pub fn get_artifact(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<ArtifactRecord, ApiError> {
+        self.storage.get_artifact(run_id, artifact_id).map_err(Into::into)
+    }
+
+    pub fn read_artifact_content(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.storage
+            .read_artifact_content(run_id, artifact_id)
+            .map_err(Into::into)
     }
 
     pub fn get_replay_job(&self, job_id: &ReplayJobId) -> Result<ReplayJobRecord, ApiError> {

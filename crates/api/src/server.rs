@@ -15,8 +15,9 @@ use replaykit_storage::Storage;
 use crate::ReplayKitService;
 use crate::errors::{ApiError, ApiErrorBody};
 use crate::views::{
-    ArtifactPreviewView, BranchExecutionView, BranchPlanView, DependencyView, ReplayJobView,
-    RunDiffSummaryView, RunSummaryView, RunTreeView, SpanDetailView,
+    ArtifactContentView, ArtifactPreviewView, BranchExecutionView, BranchPlanView,
+    BranchSummaryView, DependencyView, ReplayJobView, RunDiffSummaryView, RunSummaryView,
+    RunTreeView, SpanDetailView,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,11 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route("/api/v1/runs", get(list_runs::<S, E>))
         .route("/api/v1/runs/{run_id}", get(get_run::<S, E>))
         .route("/api/v1/runs/{run_id}/tree", get(get_run_tree::<S, E>))
+        .route("/api/v1/runs/{run_id}/edges", get(get_run_edges::<S, E>))
+        .route(
+            "/api/v1/runs/{run_id}/branches",
+            get(get_run_branches::<S, E>),
+        )
         .route(
             "/api/v1/runs/{run_id}/timeline",
             get(get_run_timeline::<S, E>),
@@ -110,6 +116,10 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route(
             "/api/v1/runs/{run_id}/spans/{span_id}/artifacts",
             get(get_span_artifacts::<S, E>),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/artifacts/{artifact_id}/content",
+            get(get_artifact_content::<S, E>),
         )
         .route(
             "/api/v1/runs/{run_id}/spans/{span_id}/dependencies",
@@ -168,6 +178,43 @@ async fn get_run_tree<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     }
 }
 
+async fn get_run_edges<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(svc): State<AppState<S, E>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match svc.list_edges(&RunId(run_id)) {
+        Ok(edges) => {
+            let views: Vec<DependencyView> =
+                edges.iter().map(DependencyView::from_record).collect();
+            Json(views).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_run_branches<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(svc): State<AppState<S, E>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    let run_id = RunId(run_id);
+    match svc.list_run_branches(&run_id) {
+        Ok(branches) => {
+            let mut views = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let patch_artifact =
+                    match svc.get_artifact(&branch.target_run_id, &branch.patch_manifest_artifact_id)
+                    {
+                        Ok(artifact) => artifact,
+                        Err(e) => return err_response(e),
+                    };
+                views.push(BranchSummaryView::from_parts(&branch, &patch_artifact));
+            }
+            Json(views).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
 /// Stub: timeline is not yet supported. Returns 501 Not Implemented.
 async fn get_run_timeline<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     State(_svc): State<AppState<S, E>>,
@@ -205,6 +252,18 @@ async fn get_span_artifacts<S: Storage + 'static, E: ExecutorRegistry + 'static>
                 .collect();
             Json(views).into_response()
         }
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_artifact_content<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(svc): State<AppState<S, E>>,
+    Path((run_id, artifact_id)): Path<(String, String)>,
+) -> Response {
+    let run_id = RunId(run_id);
+    let artifact_id = ArtifactId(artifact_id);
+    match svc.read_artifact_content(&run_id, &artifact_id) {
+        Ok(bytes) => Json(ArtifactContentView::from_bytes(&artifact_id.0, &bytes)).into_response(),
         Err(e) => err_response(e),
     }
 }

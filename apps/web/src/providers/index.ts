@@ -3,8 +3,113 @@
 import type {
   RunListItem, RunRecord, SpanRecord, SpanTreeNode,
   ArtifactRecord, SpanEdgeRecord, BranchRecord,
-  DiffSummary, BranchDraftState,
+  DiffSummary, BranchDraftState, ReplayPolicy, PatchType,
 } from '../types';
+
+type ApiRunSummary = {
+  run_id: string;
+  title: string;
+  adapter_name: string;
+  status: RunRecord['status'];
+  started_at: number;
+  ended_at: number | null;
+  error_count: number;
+  source_run_id: string | null;
+  failure_class?: string | null;
+  final_output_preview?: string | null;
+};
+
+type ApiTreeNode = {
+  span_id: string;
+  name: string;
+  kind: SpanRecord['kind'];
+  status: SpanRecord['status'];
+  replay_policy: string;
+  started_at: number;
+  ended_at: number | null;
+  error_summary: string | null;
+  children: ApiTreeNode[];
+};
+
+type ApiRunTree = {
+  run_id: string;
+  title: string;
+  status: RunRecord['status'];
+  nodes: ApiTreeNode[];
+};
+
+type ApiSpanDetail = {
+  span_id: string;
+  run_id: string;
+  parent_span_id: string | null;
+  sequence_no: number;
+  name: string;
+  kind: SpanRecord['kind'];
+  status: SpanRecord['status'];
+  replay_policy: string;
+  executor_kind: string | null;
+  executor_version: string | null;
+  input_artifact_ids: string[];
+  output_artifact_ids: string[];
+  input_fingerprint: string | null;
+  output_fingerprint: string | null;
+  environment_fingerprint: string | null;
+  error_code: string | null;
+  error_summary: string | null;
+  started_at: number;
+  ended_at: number | null;
+  attributes: Record<string, unknown>;
+};
+
+type ApiArtifactPreview = {
+  artifact_id: string;
+  artifact_type_label: string;
+  mime: string;
+  byte_len: number;
+  summary: Record<string, unknown>;
+};
+
+type ApiArtifactContent = {
+  artifact_id: string;
+  content: string;
+};
+
+type ApiDependency = {
+  edge_id: string;
+  from_span_id: string;
+  to_span_id: string;
+  kind: SpanEdgeRecord['kind'];
+};
+
+type ApiBranchSummary = {
+  branch_id: string;
+  source_run_id: string;
+  target_run_id: string;
+  fork_span_id: string;
+  patch_type: string;
+  patch_summary: string;
+  created_at: number;
+  status: BranchRecord['status'];
+};
+
+type ApiBranchExecution = {
+  branch_id: string;
+  source_run_id: string;
+  target_run_id: string;
+  target_status: BranchRecord['status'];
+};
+
+type ApiDiffSummary = {
+  diff_id: string;
+  source_run_id: string;
+  target_run_id: string;
+  source_status: RunRecord['status'];
+  target_status: RunRecord['status'];
+  changed_span_count: number;
+  changed_artifact_count: number;
+  first_divergent_span_id: string | null;
+  summary: Record<string, unknown>;
+};
 
 // ── Provider interface ──────────────────────────────────────────────
 
@@ -94,7 +199,7 @@ export class MockProvider implements ReplayKitProvider {
 
 export class LiveProvider implements ReplayKitProvider {
   private baseUrl: string;
-  constructor(baseUrl = 'http://localhost:9201') {
+  constructor(baseUrl = 'http://localhost:3210') {
     this.baseUrl = baseUrl;
   }
 
@@ -105,46 +210,331 @@ export class LiveProvider implements ReplayKitProvider {
   }
 
   async listRuns() {
-    return this.fetch<RunListItem[]>('/api/runs');
+    const runs = await this.fetch<ApiRunSummary[]>('/api/v1/runs');
+    return runs.map(run => ({
+      run_id: run.run_id,
+      title: run.title,
+      status: run.status,
+      started_at: run.started_at,
+      duration_ms: run.ended_at !== null ? Math.max(run.ended_at - run.started_at, 0) : null,
+      adapter_name: run.adapter_name,
+      failure_summary: run.failure_class ?? run.final_output_preview ?? null,
+      source_run_id: run.source_run_id,
+      span_count: 0,
+      error_count: run.error_count,
+    }));
   }
 
   async getRunRecord(runId: string) {
-    return this.fetch<RunRecord | null>(`/api/runs/${runId}`);
+    const run = await this.fetch<ApiRunSummary>(`/api/v1/runs/${runId}`);
+    return {
+      run_id: run.run_id,
+      trace_id: '',
+      source_run_id: run.source_run_id,
+      title: run.title,
+      entrypoint: '',
+      adapter_name: run.adapter_name,
+      adapter_version: '',
+      status: run.status,
+      started_at: run.started_at,
+      ended_at: run.ended_at,
+      git_sha: null,
+      environment_fingerprint: null,
+      labels: [],
+    };
   }
 
   async getRunTree(runId: string) {
-    return this.fetch<SpanTreeNode | null>(`/api/runs/${runId}/tree`);
+    const tree = await this.fetch<ApiRunTree>(`/api/v1/runs/${runId}/tree`);
+    if (tree.nodes.length === 0) return null;
+    if (tree.nodes.length === 1) return mapTreeNode(runId, tree.nodes[0], 0, null);
+
+    return {
+      span: {
+        run_id: runId,
+        span_id: `${runId}::root`,
+        trace_id: '',
+        parent_span_id: null,
+        sequence_no: 0,
+        kind: 'Run' as const,
+        name: tree.title,
+        status: mapRunStatusToSpanStatus(tree.status),
+        started_at: 0,
+        ended_at: null,
+        replay_policy: 'RecordOnly' as const,
+        executor_kind: null,
+        executor_version: null,
+        input_artifact_ids: [],
+        output_artifact_ids: [],
+        snapshot_id: null,
+        input_fingerprint: null,
+        environment_fingerprint: null,
+        error_code: null,
+        error_summary: null,
+        failure_class: null,
+        dirty_reasons: [],
+        blocked_replay_reason: null,
+        attributes: {},
+      },
+      depth: 0,
+      children: tree.nodes.map(node => mapTreeNode(runId, node, 1, `${runId}::root`)),
+    };
   }
 
   async getSpanDetail(runId: string, spanId: string) {
-    return this.fetch<SpanRecord | null>(`/api/runs/${runId}/spans/${spanId}`);
+    const span = await this.fetch<ApiSpanDetail>(`/api/v1/runs/${runId}/spans/${spanId}`);
+    return mapSpanDetail(span);
   }
 
   async getSpanArtifacts(runId: string, spanId: string) {
-    return this.fetch<ArtifactRecord[]>(`/api/runs/${runId}/spans/${spanId}/artifacts`);
+    const previews = await this.fetch<ApiArtifactPreview[]>(
+      `/api/v1/runs/${runId}/spans/${spanId}/artifacts`,
+    );
+    const contents = await Promise.all(previews.map(async preview => {
+      try {
+        return await this.fetch<ApiArtifactContent>(
+          `/api/v1/runs/${runId}/artifacts/${preview.artifact_id}/content`,
+        );
+      } catch {
+        return null;
+      }
+    }));
+
+    return previews.map((preview, index) => ({
+      artifact_id: preview.artifact_id,
+      run_id: runId,
+      span_id: spanId,
+      type: preview.artifact_type_label,
+      mime: preview.mime,
+      byte_len: preview.byte_len,
+      summary: summarizeDocument(preview.summary),
+      content: contents[index]?.content ?? summarizeDocument(preview.summary) ?? '',
+    }));
   }
 
   async getSpanEdges(runId: string) {
-    return this.fetch<SpanEdgeRecord[]>(`/api/runs/${runId}/edges`);
+    const edges = await this.fetch<ApiDependency[]>(`/api/v1/runs/${runId}/edges`);
+    return edges.map(edge => ({
+      run_id: runId,
+      from_span_id: edge.from_span_id,
+      to_span_id: edge.to_span_id,
+      kind: edge.kind,
+    }));
   }
 
   async getBranches(runId: string) {
-    return this.fetch<BranchRecord[]>(`/api/runs/${runId}/branches`);
+    const branches = await this.fetch<ApiBranchSummary[]>(`/api/v1/runs/${runId}/branches`);
+    return branches.map(branch => ({
+      branch_id: branch.branch_id,
+      source_run_id: branch.source_run_id,
+      target_run_id: branch.target_run_id,
+      fork_span_id: branch.fork_span_id,
+      patch_type: mapPatchType(branch.patch_type),
+      patch_summary: branch.patch_summary,
+      created_at: branch.created_at,
+      status: branch.status,
+    }));
   }
 
   async getDiffSummary(sourceRunId: string, targetRunId: string) {
-    return this.fetch<DiffSummary | null>(`/api/diffs/${sourceRunId}/${targetRunId}`);
+    const diff = await this.fetch<ApiDiffSummary>(
+      `/api/v1/runs/${sourceRunId}/diff/${targetRunId}`,
+    );
+    return {
+      diff_id: diff.diff_id,
+      source_run_id: diff.source_run_id,
+      target_run_id: diff.target_run_id,
+      first_divergent_span_id: diff.first_divergent_span_id ?? '',
+      status_change: { from: diff.source_status, to: diff.target_status },
+      latency_ms_delta: readInt(diff.summary, 'latency_ms_delta'),
+      token_delta: readInt(diff.summary, 'token_delta'),
+      changed_span_count: diff.changed_span_count,
+      changed_artifact_count: diff.changed_artifact_count,
+      final_output_changed: readBool(diff.summary, 'final_output_changed'),
+      span_diffs: [],
+    };
   }
 
   async createBranch(draft: BranchDraftState) {
-    const res = await fetch(`${this.baseUrl}/api/branches`, {
+    const res = await fetch(`${this.baseUrl}/api/v1/branches`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft),
+      body: JSON.stringify({
+        source_run_id: draft.source_run_id,
+        fork_span_id: draft.fork_span_id,
+        patch_type: toApiPatchType(draft.patch_type),
+        replacement: draft.patch_value,
+        note: draft.note || null,
+      }),
     });
     if (!res.ok) throw new Error(`API error: ${res.status}`);
-    return res.json() as Promise<BranchRecord>;
+    const execution = await res.json() as ApiBranchExecution;
+    return {
+      branch_id: execution.branch_id,
+      source_run_id: execution.source_run_id,
+      target_run_id: execution.target_run_id,
+      fork_span_id: draft.fork_span_id,
+      patch_type: draft.patch_type,
+      patch_summary: draft.note || `${draft.patch_type} on ${draft.fork_span_name}`,
+      created_at: Date.now(),
+      status: execution.target_status,
+    };
   }
+}
+
+function mapTreeNode(
+  runId: string,
+  node: ApiTreeNode,
+  depth: number,
+  parentSpanId: string | null,
+): SpanTreeNode {
+  return {
+    span: {
+      run_id: runId,
+      span_id: node.span_id,
+      trace_id: '',
+      parent_span_id: parentSpanId,
+      sequence_no: depth,
+      kind: node.kind,
+      name: node.name,
+      status: node.status,
+      started_at: node.started_at,
+      ended_at: node.ended_at,
+      replay_policy: mapReplayPolicy(node.replay_policy),
+      executor_kind: null,
+      executor_version: null,
+      input_artifact_ids: [],
+      output_artifact_ids: [],
+      snapshot_id: null,
+      input_fingerprint: null,
+      environment_fingerprint: null,
+      error_code: null,
+      error_summary: node.error_summary,
+      failure_class: null,
+      dirty_reasons: [],
+      blocked_replay_reason: null,
+      attributes: {},
+    },
+    depth,
+    children: node.children.map(child => mapTreeNode(runId, child, depth + 1, node.span_id)),
+  };
+}
+
+function mapSpanDetail(span: ApiSpanDetail): SpanRecord {
+  return {
+    run_id: span.run_id,
+    span_id: span.span_id,
+    trace_id: '',
+    parent_span_id: span.parent_span_id,
+    sequence_no: span.sequence_no,
+    kind: span.kind,
+    name: span.name,
+    status: span.status,
+    started_at: span.started_at,
+    ended_at: span.ended_at,
+    replay_policy: mapReplayPolicy(span.replay_policy),
+    executor_kind: span.executor_kind,
+    executor_version: span.executor_version,
+    input_artifact_ids: span.input_artifact_ids,
+    output_artifact_ids: span.output_artifact_ids,
+    snapshot_id: null,
+    input_fingerprint: span.input_fingerprint,
+    environment_fingerprint: span.environment_fingerprint,
+    error_code: span.error_code,
+    error_summary: span.error_summary,
+    failure_class: null,
+    dirty_reasons: [],
+    blocked_replay_reason: null,
+    attributes: span.attributes,
+  };
+}
+
+function mapReplayPolicy(policy: string): ReplayPolicy {
+  switch (policy) {
+    case 'record_only':
+    case 'RecordOnly':
+      return 'RecordOnly';
+    case 'rerunnable_supported':
+    case 'RerunnableSupported':
+      return 'RerunnableSupported';
+    case 'cacheable_if_fingerprint_matches':
+    case 'CacheableIfFingerprintMatches':
+      return 'CacheableIfFingerprintMatches';
+    case 'pure_reusable':
+    case 'PureReusable':
+      return 'PureReusable';
+    default:
+      return 'RecordOnly';
+  }
+}
+
+function mapRunStatusToSpanStatus(status: RunRecord['status']): SpanRecord['status'] {
+  switch (status) {
+    case 'Running':
+      return 'Running';
+    case 'Completed':
+      return 'Completed';
+    case 'Failed':
+      return 'Failed';
+    case 'Blocked':
+      return 'Blocked';
+    case 'Canceled':
+      return 'Canceled';
+    case 'Interrupted':
+    case 'Imported':
+      return 'Blocked';
+  }
+}
+
+function mapPatchType(patchType: string): PatchType {
+  switch (patchType) {
+    case 'PromptEdit':
+    case 'ToolOutputOverride':
+    case 'EnvVarOverride':
+    case 'ModelConfigEdit':
+    case 'RetrievalContextOverride':
+    case 'SnapshotOverride':
+      return patchType;
+    default:
+      return 'ToolOutputOverride';
+  }
+}
+
+function toApiPatchType(patchType: PatchType): string {
+  switch (patchType) {
+    case 'PromptEdit':
+      return 'prompt_edit';
+    case 'ToolOutputOverride':
+      return 'tool_output_override';
+    case 'EnvVarOverride':
+      return 'env_var_override';
+    case 'ModelConfigEdit':
+      return 'model_config_edit';
+    case 'RetrievalContextOverride':
+      return 'retrieval_context_override';
+    case 'SnapshotOverride':
+      return 'snapshot_override';
+  }
+}
+
+function summarizeDocument(summary: Record<string, unknown> | null | undefined): string | null {
+  if (!summary || Object.keys(summary).length === 0) return null;
+  const preferredKeys = ['note', 'replacement', 'tool', 'answer', 'prompt', 'state'];
+  for (const key of preferredKeys) {
+    const value = summary[key];
+    if (typeof value === 'string' && value.trim().length > 0) return value;
+  }
+  return JSON.stringify(summary, null, 2);
+}
+
+function readInt(summary: Record<string, unknown>, key: string): number {
+  const value = summary[key];
+  return typeof value === 'number' ? value : 0;
+}
+
+function readBool(summary: Record<string, unknown>, key: string): boolean {
+  const value = summary[key];
+  return typeof value === 'boolean' ? value : false;
 }
 
 // ── Factory ─────────────────────────────────────────────────────────

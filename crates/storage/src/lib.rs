@@ -75,6 +75,7 @@ pub trait Storage: Send + Sync {
 
     fn insert_branch(&self, branch: BranchRecord) -> Result<(), StorageError>;
     fn get_branch(&self, branch_id: &BranchId) -> Result<BranchRecord, StorageError>;
+    fn list_branches(&self) -> Result<Vec<BranchRecord>, StorageError>;
 
     fn insert_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError>;
     fn update_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError>;
@@ -641,6 +642,14 @@ impl Storage for InMemoryStorage {
             .get(branch_id)
             .cloned()
             .ok_or_else(|| StorageError::NotFound(format!("branch {:?} not found", branch_id.0)))
+    }
+
+    fn list_branches(&self) -> Result<Vec<BranchRecord>, StorageError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| StorageError::Internal("failed to lock storage for branch list".into()))?;
+        Ok(state.branches.values().cloned().collect())
     }
 
     fn insert_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
@@ -1595,6 +1604,18 @@ impl Storage for SqliteStorage {
                     StorageError::NotFound(format!("branch {:?} not found", branch_id.0))
                 })?;
             decode_json(&payload)
+        })
+    }
+
+    fn list_branches(&self) -> Result<Vec<BranchRecord>, StorageError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT payload_json FROM branches ORDER BY branch_id ASC")
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+            collect_json_rows(rows)
         })
     }
 

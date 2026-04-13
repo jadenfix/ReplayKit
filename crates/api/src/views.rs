@@ -1,8 +1,8 @@
 use replaykit_core_model::{
     ArtifactRecord, ArtifactType, BranchPlan, BranchRecord, CostMetrics, DirtyReason,
-    DirtySpanRecord, Document, EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus,
-    ReplayMode, ReplayPolicy, RunDiffRecord, RunRecord, RunStatus, RunTreeNode, SpanEdgeRecord,
-    SpanKind, SpanRecord, SpanStatus,
+    DirtySpanRecord, Document, EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus, ReplayMode,
+    ReplayPolicy, RunDiffRecord, RunRecord, RunStatus, RunTreeNode, SpanEdgeRecord, SpanKind,
+    SpanRecord, SpanStatus, Value,
 };
 use serde::Serialize;
 
@@ -14,6 +14,7 @@ use serde::Serialize;
 pub struct RunSummaryView {
     pub run_id: String,
     pub title: String,
+    pub adapter_name: String,
     pub status: RunStatus,
     pub status_label: &'static str,
     pub started_at: u64,
@@ -33,6 +34,7 @@ impl RunSummaryView {
         Self {
             run_id: r.run_id.0.clone(),
             title: r.title.clone(),
+            adapter_name: r.adapter_name.clone(),
             status: r.status,
             status_label: run_status_label(r.status),
             started_at: r.started_at,
@@ -79,6 +81,7 @@ pub struct TreeNodeView {
     pub kind: SpanKind,
     pub status: SpanStatus,
     pub status_label: &'static str,
+    pub replay_policy: &'static str,
     pub started_at: u64,
     pub ended_at: Option<u64>,
     pub error_summary: Option<String>,
@@ -99,6 +102,7 @@ impl TreeNodeView {
             kind: node.span.kind,
             status: node.span.status,
             status_label: span_status_label(node.span.status),
+            replay_policy: replay_policy_label(node.span.replay_policy),
             started_at: node.span.started_at,
             ended_at: node.span.ended_at,
             error_summary: node.span.error_summary.clone(),
@@ -117,6 +121,7 @@ pub struct SpanDetailView {
     pub span_id: String,
     pub run_id: String,
     pub parent_span_id: Option<String>,
+    pub sequence_no: u64,
     pub name: String,
     pub kind: SpanKind,
     pub status: SpanStatus,
@@ -126,8 +131,11 @@ pub struct SpanDetailView {
     pub replay_policy: &'static str,
     pub executor_kind: Option<String>,
     pub executor_version: Option<String>,
+    pub input_artifact_ids: Vec<String>,
+    pub output_artifact_ids: Vec<String>,
     pub input_fingerprint: Option<String>,
     pub output_fingerprint: Option<String>,
+    pub environment_fingerprint: Option<String>,
     pub error_code: Option<String>,
     pub error_summary: Option<String>,
     pub cost: CostMetrics,
@@ -142,6 +150,7 @@ impl SpanDetailView {
             span_id: s.span_id.0.clone(),
             run_id: s.run_id.0.clone(),
             parent_span_id: s.parent_span_id.as_ref().map(|id| id.0.clone()),
+            sequence_no: s.sequence_no,
             name: s.name.clone(),
             kind: s.kind,
             status: s.status,
@@ -151,8 +160,11 @@ impl SpanDetailView {
             replay_policy: replay_policy_label(s.replay_policy),
             executor_kind: s.executor_kind.clone(),
             executor_version: s.executor_version.clone(),
+            input_artifact_ids: s.input_artifact_ids.iter().map(|id| id.0.clone()).collect(),
+            output_artifact_ids: s.output_artifact_ids.iter().map(|id| id.0.clone()).collect(),
             input_fingerprint: s.input_fingerprint.clone(),
             output_fingerprint: s.output_fingerprint.clone(),
+            environment_fingerprint: s.environment_fingerprint.clone(),
             error_code: s.error_code.clone(),
             error_summary: s.error_summary.clone(),
             cost: s.cost.clone(),
@@ -171,6 +183,7 @@ impl SpanDetailView {
 pub struct ArtifactPreviewView {
     pub artifact_id: String,
     pub artifact_type: ArtifactType,
+    pub artifact_type_label: &'static str,
     pub mime: String,
     pub byte_len: usize,
     pub summary: Document,
@@ -182,10 +195,26 @@ impl ArtifactPreviewView {
         Self {
             artifact_id: a.artifact_id.0.clone(),
             artifact_type: a.artifact_type,
+            artifact_type_label: artifact_type_label(a.artifact_type),
             mime: a.mime.clone(),
             byte_len: a.byte_len,
             summary: a.summary.clone(),
             created_at: a.created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ArtifactContentView {
+    pub artifact_id: String,
+    pub content: String,
+}
+
+impl ArtifactContentView {
+    pub fn from_bytes(artifact_id: &str, bytes: &[u8]) -> Self {
+        Self {
+            artifact_id: artifact_id.to_owned(),
+            content: String::from_utf8_lossy(bytes).into_owned(),
         }
     }
 }
@@ -321,6 +350,51 @@ impl BranchExecutionView {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct BranchSummaryView {
+    pub branch_id: String,
+    pub source_run_id: String,
+    pub target_run_id: String,
+    pub fork_span_id: String,
+    pub patch_type: String,
+    pub patch_summary: String,
+    pub created_at: u64,
+    pub status: RunStatus,
+    pub status_label: &'static str,
+}
+
+impl BranchSummaryView {
+    pub fn from_parts(branch: &BranchRecord, patch_artifact: &ArtifactRecord) -> Self {
+        let patch_type = patch_artifact
+            .summary
+            .get("patch_type")
+            .map(value_to_summary_text)
+            .unwrap_or_else(|| "UnknownPatch".to_owned());
+        let patch_summary = patch_artifact
+            .summary
+            .get("note")
+            .map(value_to_summary_text)
+            .or_else(|| {
+                patch_artifact
+                    .summary
+                    .get("replacement")
+                    .map(value_to_summary_text)
+            })
+            .unwrap_or_else(|| format!("{patch_type} on {}", branch.fork_span_id.0));
+        Self {
+            branch_id: branch.branch_id.0.clone(),
+            source_run_id: branch.source_run_id.0.clone(),
+            target_run_id: branch.target_run_id.0.clone(),
+            fork_span_id: branch.fork_span_id.0.clone(),
+            patch_type,
+            patch_summary,
+            created_at: branch.created_at,
+            status: branch.status,
+            status_label: run_status_label(branch.status),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Branch plan view
 // ---------------------------------------------------------------------------
@@ -415,6 +489,28 @@ pub fn replay_policy_label(p: ReplayPolicy) -> &'static str {
     }
 }
 
+pub fn artifact_type_label(t: ArtifactType) -> &'static str {
+    match t {
+        ArtifactType::Prompt => "prompt",
+        ArtifactType::ModelRequest => "model_request",
+        ArtifactType::ModelResponse => "model_response",
+        ArtifactType::ToolInput => "tool_input",
+        ArtifactType::ToolOutput => "tool_output",
+        ArtifactType::ShellStdout => "shell_stdout",
+        ArtifactType::ShellStderr => "shell_stderr",
+        ArtifactType::FileDiff => "file_diff",
+        ArtifactType::FileBlob => "file_blob",
+        ArtifactType::DomSnapshot => "dom_snapshot",
+        ArtifactType::Screenshot => "screenshot",
+        ArtifactType::StateSnapshot => "state_snapshot",
+        ArtifactType::RetrievalResult => "retrieval_result",
+        ArtifactType::MemoryState => "memory_state",
+        ArtifactType::HumanMessage => "human_message",
+        ArtifactType::DebugLog => "debug_log",
+        ArtifactType::PatchManifest => "patch_manifest",
+    }
+}
+
 pub fn dirty_reason_label(r: DirtyReason) -> &'static str {
     match r {
         DirtyReason::PatchedInput => "patched_input",
@@ -424,5 +520,20 @@ pub fn dirty_reason_label(r: DirtyReason) -> &'static str {
         DirtyReason::PolicyForcedRerun => "policy_forced_rerun",
         DirtyReason::MissingReusableArtifact => "missing_reusable_artifact",
         DirtyReason::DependencyUnknown => "dependency_unknown",
+    }
+}
+
+fn value_to_summary_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(v) => v.to_string(),
+        Value::Int(v) => v.to_string(),
+        Value::Text(v) => v.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(value_to_summary_text)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(map) => format!("{map:?}"),
     }
 }
