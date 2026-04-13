@@ -471,14 +471,113 @@ async fn cached_diff_returns_404_when_not_computed() {
 }
 
 #[tokio::test]
-async fn timeline_returns_501_stub() {
+async fn timeline_returns_200_with_entries() {
     let (server, run_id) = seeded_server();
     let resp = server
         .get(&format!("/api/v1/runs/{}/timeline", run_id.0))
         .await;
-    resp.assert_status(axum::http::StatusCode::NOT_IMPLEMENTED);
+    resp.assert_status_ok();
     let body: serde_json::Value = resp.json();
-    assert_eq!(body["code"], "not_implemented");
+    assert_eq!(body["run_id"], run_id.0);
+    let entries = body["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3); // planner, tool, answer
+    // Verify sorted by started_at
+    let started_ats: Vec<u64> = entries
+        .iter()
+        .map(|e| e["started_at"].as_u64().unwrap())
+        .collect();
+    assert!(started_ats.windows(2).all(|w| w[0] <= w[1]));
+    // Verify depth: planner=0, tool=1, answer=1
+    assert_eq!(entries[0]["depth"], 0);
+    assert_eq!(entries[1]["depth"], 1);
+    assert_eq!(entries[2]["depth"], 1);
+}
+
+#[tokio::test]
+async fn timeline_golden_shape() {
+    let (server, run_id) = seeded_server();
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/timeline", run_id.0))
+        .await;
+    let body: serde_json::Value = resp.json();
+    for key in &[
+        "run_id",
+        "title",
+        "status",
+        "total_started_at",
+        "total_ended_at",
+        "entries",
+    ] {
+        assert!(
+            body.get(key).is_some(),
+            "missing key '{key}' in TimelineView"
+        );
+    }
+    let entry = &body["entries"][0];
+    for key in &[
+        "span_id",
+        "name",
+        "kind",
+        "status",
+        "status_label",
+        "started_at",
+        "ended_at",
+        "depth",
+        "parent_span_id",
+        "error_summary",
+    ] {
+        assert!(
+            entry.get(key).is_some(),
+            "missing key '{key}' in TimelineEntryView"
+        );
+    }
+}
+
+#[tokio::test]
+async fn timeline_returns_404_for_missing_run() {
+    let (server, _) = seeded_server();
+    let resp = server.get("/api/v1/runs/nonexistent/timeline").await;
+    resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn forensics_returns_200_with_failure_analysis() {
+    let (server, run_id) = seeded_server();
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/forensics", run_id.0))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["run_id"], run_id.0);
+    assert_eq!(body["has_failure"], true);
+    assert!(body["first_failed_span_id"].is_string());
+    assert!(body["deepest_failed_span_id"].is_string());
+    assert!(body["failure_path"].is_array());
+    assert!(body["blocked_spans"].is_array());
+}
+
+#[tokio::test]
+async fn forensics_golden_shape() {
+    let (server, run_id) = seeded_server();
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/forensics", run_id.0))
+        .await;
+    let body: serde_json::Value = resp.json();
+    for key in &[
+        "run_id",
+        "has_failure",
+        "first_failed_span_id",
+        "deepest_failed_span_id",
+        "deepest_failing_dependency_id",
+        "failure_path",
+        "blocked_spans",
+        "retry_groups",
+    ] {
+        assert!(
+            body.get(key).is_some(),
+            "missing key '{key}' in FailureForensicsView"
+        );
+    }
 }
 
 #[tokio::test]
@@ -616,11 +715,23 @@ async fn diff_golden_shape() {
         "changed_span_count",
         "changed_artifact_count",
         "first_divergent_span_id",
+        "span_diffs",
+        "latency_ms_delta",
+        "token_delta",
+        "final_output_changed",
         "summary",
     ] {
         assert!(
             body.get(key).is_some(),
             "missing key '{key}' in RunDiffSummaryView"
         );
+    }
+
+    // Verify span_diffs is populated
+    let span_diffs = body["span_diffs"].as_array().unwrap();
+    assert!(!span_diffs.is_empty(), "span_diffs should not be empty");
+    let sd = &span_diffs[0];
+    for key in &["span_id_source", "span_id_target", "name", "output_changed"] {
+        assert!(sd.get(key).is_some(), "missing key '{key}' in SpanDiffView");
     }
 }

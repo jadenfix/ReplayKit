@@ -17,7 +17,7 @@ use crate::errors::{ApiError, ApiErrorBody};
 use crate::views::{
     ArtifactContentView, ArtifactPreviewView, BranchExecutionView, BranchPlanView,
     BranchSummaryView, DependencyView, ReplayJobView, RunDiffSummaryView, RunSummaryView,
-    RunTreeView, SpanDetailView,
+    RunTreeView, SpanDetailView, TimelineEntryView, TimelineView,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +108,10 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route(
             "/api/v1/runs/{run_id}/timeline",
             get(get_run_timeline::<S, E>),
+        )
+        .route(
+            "/api/v1/runs/{run_id}/forensics",
+            get(get_run_forensics::<S, E>),
         )
         .route(
             "/api/v1/runs/{run_id}/spans/{span_id}",
@@ -201,12 +205,12 @@ async fn get_run_branches<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         Ok(branches) => {
             let mut views = Vec::with_capacity(branches.len());
             for branch in branches {
-                let patch_artifact =
-                    match svc.get_artifact(&branch.target_run_id, &branch.patch_manifest_artifact_id)
-                    {
-                        Ok(artifact) => artifact,
-                        Err(e) => return err_response(e),
-                    };
+                let patch_artifact = match svc
+                    .get_artifact(&branch.target_run_id, &branch.patch_manifest_artifact_id)
+                {
+                    Ok(artifact) => artifact,
+                    Err(e) => return err_response(e),
+                };
                 views.push(BranchSummaryView::from_parts(&branch, &patch_artifact));
             }
             Json(views).into_response()
@@ -215,19 +219,35 @@ async fn get_run_branches<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     }
 }
 
-/// Stub: timeline is not yet supported. Returns 501 Not Implemented.
 async fn get_run_timeline<S: Storage + 'static, E: ExecutorRegistry + 'static>(
-    State(_svc): State<AppState<S, E>>,
-    Path(_run_id): Path<String>,
+    State(svc): State<AppState<S, E>>,
+    Path(run_id): Path<String>,
 ) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "code": "not_implemented",
-            "message": "timeline endpoint is not yet implemented; use /tree for span hierarchy"
-        })),
-    )
-        .into_response()
+    let rid = RunId(run_id);
+    let run = match svc.get_run(&rid) {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
+    match svc.run_timeline(&rid) {
+        Ok(entries) => {
+            let views: Vec<TimelineEntryView> = entries
+                .iter()
+                .map(|(span, depth)| TimelineEntryView::from_span(span, *depth))
+                .collect();
+            Json(TimelineView::from_parts(&run, views)).into_response()
+        }
+        Err(e) => err_response(e),
+    }
+}
+
+async fn get_run_forensics<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(svc): State<AppState<S, E>>,
+    Path(run_id): Path<String>,
+) -> Response {
+    match svc.run_forensics(&RunId(run_id)) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => err_response(e),
+    }
 }
 
 async fn get_span_detail<S: Storage + 'static, E: ExecutorRegistry + 'static>(
