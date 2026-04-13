@@ -1,5 +1,6 @@
 import type { RunListItem } from '../types';
-import { StatusBadge, formatDuration, formatTime } from './StatusBadge';
+import { StatusBadge } from './StatusBadge';
+import { formatDuration, formatTime } from '../utils/format';
 
 interface RunListProps {
   runs: RunListItem[];

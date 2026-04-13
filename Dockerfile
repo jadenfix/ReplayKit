@@ -5,6 +5,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY examples ./examples
+COPY fixtures ./fixtures
 COPY apps ./apps
 
 RUN cargo build --release -p replaykit-cli -p replaykit-collector

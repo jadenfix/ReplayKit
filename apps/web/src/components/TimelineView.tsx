@@ -1,5 +1,6 @@
 import type { TimelineView as TimelineViewType } from '../types';
-import { KindIcon, StatusBadge, formatDuration } from './StatusBadge';
+import { KindIcon, StatusBadge } from './StatusBadge';
+import { formatDuration } from '../utils/format';
 
 interface TimelineViewProps {
   timeline: TimelineViewType | null;

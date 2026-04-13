@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
 import type { SpanTreeNode, SpanRecord } from '../types';
-import { StatusBadge, KindIcon, formatDuration } from './StatusBadge';
+import { StatusBadge, KindIcon } from './StatusBadge';
+import { formatDuration } from '../utils/format';
 
 interface RunTreeProps {
   tree: SpanTreeNode | null;

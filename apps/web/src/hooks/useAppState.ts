@@ -1,4 +1,4 @@
-import { useReducer, useCallback, useEffect, useRef } from 'react';
+import { useReducer, useCallback, useEffect } from 'react';
 import type {
   AppState, BottomTab, BranchDraftState, CenterView,
   SpanRecord, RunRecord, SpanTreeNode,
@@ -147,58 +147,56 @@ function defaultPatchType(span: SpanRecord): PatchType {
 
 export function useAppState(provider: ReplayKitProvider) {
   const [state, dispatch] = useReducer(reducer, INIT);
-  const providerRef = useRef(provider);
-  providerRef.current = provider;
 
   // Load runs on mount
   useEffect(() => {
     dispatch({ type: 'RUNS_LOADING' });
-    providerRef.current.listRuns().then(runs => {
+    provider.listRuns().then(runs => {
       dispatch({ type: 'RUNS_LOADED', runs });
     }).catch(err => {
       console.error('Failed to load runs:', err);
       dispatch({ type: 'RUNS_LOADED', runs: [] });
     });
-  }, []);
+  }, [provider]);
 
   // Load tree when run selected
   useEffect(() => {
     if (!state.selectedRunId) return;
     const runId = state.selectedRunId;
     Promise.all([
-      providerRef.current.getRunTree(runId),
-      providerRef.current.getRunRecord(runId),
-      providerRef.current.getBranches(runId),
-      providerRef.current.getSpanEdges(runId),
+      provider.getRunTree(runId),
+      provider.getRunRecord(runId),
+      provider.getBranches(runId),
+      provider.getSpanEdges(runId),
     ]).then(([tree, run, branches, edges]) => {
       dispatch({ type: 'TREE_LOADED', tree, run, branches, edges });
     }).catch(err => {
       console.error('Failed to load run tree:', err);
       dispatch({ type: 'TREE_LOADED', tree: null, run: null, branches: [], edges: [] });
     });
-  }, [state.selectedRunId]);
+  }, [provider, state.selectedRunId]);
 
   // Load timeline in parallel with tree
   useEffect(() => {
     if (!state.selectedRunId) return;
     const runId = state.selectedRunId;
-    providerRef.current.getTimeline(runId).then(timeline => {
+    provider.getTimeline(runId).then(timeline => {
       dispatch({ type: 'TIMELINE_LOADED', timeline });
     }).catch(() => {
       dispatch({ type: 'TIMELINE_LOADED', timeline: null });
     });
-  }, [state.selectedRunId]);
+  }, [provider, state.selectedRunId]);
 
   // Load forensics in parallel with tree
   useEffect(() => {
     if (!state.selectedRunId) return;
     const runId = state.selectedRunId;
-    providerRef.current.getForensics(runId).then(forensics => {
+    provider.getForensics(runId).then(forensics => {
       dispatch({ type: 'FORENSICS_LOADED', forensics });
     }).catch(() => {
       dispatch({ type: 'FORENSICS_LOADED', forensics: null });
     });
-  }, [state.selectedRunId]);
+  }, [provider, state.selectedRunId]);
 
   // Load span detail when span selected
   useEffect(() => {
@@ -206,16 +204,16 @@ export function useAppState(provider: ReplayKitProvider) {
     const runId = state.selectedRunId;
     const spanId = state.selectedSpanId;
     Promise.all([
-      providerRef.current.getSpanDetail(runId, spanId),
-      providerRef.current.getSpanArtifacts(runId, spanId),
-      providerRef.current.getSpanEdges(runId),
+      provider.getSpanDetail(runId, spanId),
+      provider.getSpanArtifacts(runId, spanId),
+      provider.getSpanEdges(runId),
     ]).then(([span, artifacts, edges]) => {
       dispatch({ type: 'SPAN_LOADED', span, artifacts, edges });
     }).catch(err => {
       console.error('Failed to load span detail:', err);
       dispatch({ type: 'SPAN_LOADED', span: null, artifacts: [], edges: [] });
     });
-  }, [state.selectedRunId, state.selectedSpanId]);
+  }, [provider, state.selectedRunId, state.selectedSpanId]);
 
   const selectRun = useCallback((runId: string) => {
     dispatch({ type: 'SELECT_RUN', runId });
@@ -243,14 +241,14 @@ export function useAppState(provider: ReplayKitProvider) {
 
   const submitBranch = useCallback(async () => {
     if (!state.branchDraft) return;
-    const branch = await providerRef.current.createBranch(state.branchDraft);
+    const branch = await provider.createBranch(state.branchDraft);
     dispatch({ type: 'BRANCH_CREATED', branch });
-  }, [state.branchDraft]);
+  }, [provider, state.branchDraft]);
 
   const loadDiff = useCallback(async (sourceRunId: string, targetRunId: string) => {
-    const diff = await providerRef.current.getDiffSummary(sourceRunId, targetRunId);
+    const diff = await provider.getDiffSummary(sourceRunId, targetRunId);
     dispatch({ type: 'DIFF_LOADED', diff });
-  }, []);
+  }, [provider]);
 
   const jumpToSpan = useCallback((spanId: string) => {
     dispatch({ type: 'SELECT_SPAN', spanId });

@@ -1,5 +1,6 @@
 import type { SpanRecord, ArtifactRecord, SpanEdgeRecord } from '../types';
-import { StatusBadge, KindIcon, PolicyBadge, formatDuration, formatTime } from './StatusBadge';
+import { StatusBadge, KindIcon, PolicyBadge } from './StatusBadge';
+import { formatDuration, formatTime } from '../utils/format';
 
 interface SpanInspectorProps {
   span: SpanRecord | null;

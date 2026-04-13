@@ -148,16 +148,16 @@ impl<S: Storage> DiffEngine<S> {
                     .map(|sd| {
                         let mut obj = Document::new();
                         obj.insert("span_id_source".into(), Value::Text(sd.0.clone()));
-                        obj.insert("span_id_target".into(), Value::Text(sd.0.clone()));
-                        obj.insert("name".into(), Value::Text(sd.1.clone()));
-                        if let Some(ref sc) = sd.2 {
+                        obj.insert("span_id_target".into(), Value::Text(sd.1.clone()));
+                        obj.insert("name".into(), Value::Text(sd.2.clone()));
+                        if let Some(ref sc) = sd.3 {
                             obj.insert("status_change".into(), Value::Text(sc.clone()));
                         }
-                        if let Some(d) = sd.3 {
+                        if let Some(d) = sd.4 {
                             obj.insert("duration_ms_delta".into(), Value::Int(d));
                         }
-                        obj.insert("output_changed".into(), Value::Bool(sd.4));
-                        if let Some(ref dr) = sd.5 {
+                        obj.insert("output_changed".into(), Value::Bool(sd.5));
+                        if let Some(ref dr) = sd.6 {
                             obj.insert("dirty_reason".into(), Value::Text(dr.clone()));
                         }
                         Value::Object(obj)
@@ -193,7 +193,7 @@ impl<S: Storage> DiffEngine<S> {
     }
 }
 
-/// Returns (span_id, name, status_change, duration_ms_delta, output_changed, dirty_reason)
+/// Returns (source_span_id, target_span_id, name, status_change, duration_ms_delta, output_changed, dirty_reason)
 fn build_span_diff(
     span_id: &SpanId,
     source: Option<&SpanRecord>,
@@ -201,11 +201,14 @@ fn build_span_diff(
 ) -> (
     String,
     String,
+    String,
     Option<String>,
     Option<i64>,
     bool,
     Option<String>,
 ) {
+    let source_span_id = source.map(|s| s.span_id.0.clone()).unwrap_or_default();
+    let target_span_id = target.map(|s| s.span_id.0.clone()).unwrap_or_default();
     let name = source
         .or(target)
         .map(|s| s.name.clone())
@@ -242,7 +245,16 @@ fn build_span_diff(
         _ => None,
     };
     (
-        span_id.0.clone(),
+        if source_span_id.is_empty() {
+            span_id.0.clone()
+        } else {
+            source_span_id
+        },
+        if target_span_id.is_empty() {
+            span_id.0.clone()
+        } else {
+            target_span_id
+        },
         name,
         status_change,
         duration_ms_delta,

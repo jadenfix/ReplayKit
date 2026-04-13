@@ -1,5 +1,6 @@
 import type { DiffSummary as DiffSummaryType } from '../types';
-import { StatusBadge, formatDuration } from './StatusBadge';
+import { StatusBadge } from './StatusBadge';
+import { formatDuration } from '../utils/format';
 
 interface DiffSummaryProps {
   diff: DiffSummaryType | null;

@@ -144,7 +144,7 @@ impl BlobStore for LocalBlobStore {
         // Atomic rename. On failure due to existing target, that is fine (race).
         match fs::rename(&tmp_path, &final_path) {
             Ok(()) => {}
-            Err(e) if final_path.exists() => {
+            Err(_rename_err) if final_path.exists() => {
                 // Another writer raced and won. Clean up our temp.
                 let _ = fs::remove_file(&tmp_path);
                 tracing::debug!(sha256 = %hash, "blob appeared during write (race), dedup");

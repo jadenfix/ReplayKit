@@ -222,8 +222,8 @@ fn seed_run<S: Storage, E: ExecutorRegistry>(
         .add_edge(
             &run.run_id,
             replaykit_collector::EdgeSpec {
-                from_span_id: tool.span_id,
-                to_span_id: answer.span_id,
+                from_span_id: answer.span_id,
+                to_span_id: tool.span_id,
                 kind: replaykit_core_model::EdgeKind::DataDependsOn,
                 attributes: Document::new(),
             },
@@ -248,6 +248,160 @@ fn seeded_server_with_storage() -> (TestServer, RunId, Arc<InMemoryStorage>) {
     let router = build_router(service);
     let server = TestServer::new(router).expect("test server");
     (server, run_id, storage)
+}
+
+fn seeded_server_with_failed_dependency() -> (TestServer, RunId) {
+    let storage = Arc::new(InMemoryStorage::new());
+    let service = Arc::new(ReplayKitService::new(storage, FakeExecutorRegistry));
+    let run = service
+        .begin_run(BeginRun {
+            title: "failed dependency run".into(),
+            entrypoint: "agent.main".into(),
+            adapter_name: "test".into(),
+            adapter_version: "0.1.0".into(),
+            started_at: 1,
+            git_sha: None,
+            environment_fingerprint: None,
+            host: HostMetadata {
+                os: "macos".into(),
+                arch: "arm64".into(),
+                hostname: None,
+            },
+            labels: Vec::new(),
+        })
+        .unwrap();
+
+    let planner = service
+        .start_span(
+            &run.run_id,
+            &run.trace_id,
+            SpanSpec {
+                span_id: Some(SpanId("planner".into())),
+                parent_span_id: None,
+                kind: SpanKind::PlannerStep,
+                name: "planner".into(),
+                started_at: 1,
+                replay_policy: ReplayPolicy::RecordOnly,
+                executor_kind: None,
+                executor_version: None,
+                input_artifact_ids: Vec::new(),
+                input_fingerprint: None,
+                environment_fingerprint: None,
+                attributes: Document::new(),
+            },
+        )
+        .unwrap();
+    service
+        .end_span(
+            &run.run_id,
+            &planner.span_id,
+            EndSpan {
+                ended_at: 2,
+                status: SpanStatus::Completed,
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                output_fingerprint: Some("planner".into()),
+                error_code: None,
+                error_summary: None,
+                cost: CostMetrics::default(),
+            },
+        )
+        .unwrap();
+
+    let tool = service
+        .start_span(
+            &run.run_id,
+            &run.trace_id,
+            SpanSpec {
+                span_id: Some(SpanId("tool".into())),
+                parent_span_id: Some(planner.span_id.clone()),
+                kind: SpanKind::ToolCall,
+                name: "tool".into(),
+                started_at: 3,
+                replay_policy: ReplayPolicy::RerunnableSupported,
+                executor_kind: None,
+                executor_version: None,
+                input_artifact_ids: Vec::new(),
+                input_fingerprint: None,
+                environment_fingerprint: None,
+                attributes: Document::new(),
+            },
+        )
+        .unwrap();
+    service
+        .end_span(
+            &run.run_id,
+            &tool.span_id,
+            EndSpan {
+                ended_at: 4,
+                status: SpanStatus::Failed,
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                output_fingerprint: Some("tool-out".into()),
+                error_code: None,
+                error_summary: Some("tool failed".into()),
+                cost: CostMetrics::default(),
+            },
+        )
+        .unwrap();
+
+    let answer = service
+        .start_span(
+            &run.run_id,
+            &run.trace_id,
+            SpanSpec {
+                span_id: Some(SpanId("answer".into())),
+                parent_span_id: Some(planner.span_id.clone()),
+                kind: SpanKind::LlmCall,
+                name: "answer".into(),
+                started_at: 5,
+                replay_policy: ReplayPolicy::RerunnableSupported,
+                executor_kind: Some("fake-llm".into()),
+                executor_version: Some("v1".into()),
+                input_artifact_ids: Vec::new(),
+                input_fingerprint: Some("answer-in".into()),
+                environment_fingerprint: None,
+                attributes: Document::new(),
+            },
+        )
+        .unwrap();
+    service
+        .end_span(
+            &run.run_id,
+            &answer.span_id,
+            EndSpan {
+                ended_at: 6,
+                status: SpanStatus::Failed,
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                output_fingerprint: Some("answer-out".into()),
+                error_code: None,
+                error_summary: Some("answer failed".into()),
+                cost: CostMetrics::default(),
+            },
+        )
+        .unwrap();
+
+    service
+        .add_edge(
+            &run.run_id,
+            replaykit_collector::EdgeSpec {
+                from_span_id: answer.span_id,
+                to_span_id: tool.span_id,
+                kind: replaykit_core_model::EdgeKind::DataDependsOn,
+                attributes: Document::new(),
+            },
+        )
+        .unwrap();
+
+    service
+        .finish_run(&run.run_id, 7, RunStatus::Failed, Some("failed".into()))
+        .unwrap();
+
+    let run_id = run.run_id.clone();
+    let router = build_router(service);
+    let server = TestServer::new(router).expect("test server");
+    (server, run_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +708,23 @@ async fn forensics_returns_200_with_failure_analysis() {
     assert!(body["deepest_failed_span_id"].is_string());
     assert!(body["failure_path"].is_array());
     assert!(body["blocked_spans"].is_array());
+    assert!(body["deepest_failing_dependency_id"].is_null());
+}
+
+#[tokio::test]
+async fn forensics_reports_failed_dependency_chain() {
+    let (server, run_id) = seeded_server_with_failed_dependency();
+    let resp = server
+        .get(&format!("/api/v1/runs/{}/forensics", run_id.0))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["deepest_failed_span_id"], "answer");
+    assert_eq!(body["deepest_failing_dependency_id"], "tool");
+    assert_eq!(
+        body["failure_path"],
+        serde_json::json!(["planner", "answer"])
+    );
 }
 
 #[tokio::test]

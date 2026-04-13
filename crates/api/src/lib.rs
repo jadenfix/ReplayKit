@@ -349,19 +349,24 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
 }
 
 fn find_deepest_failure(nodes: &[RunTreeNode]) -> Option<String> {
-    fn walk(nodes: &[RunTreeNode], depth: usize, best: &mut Option<(usize, String)>) {
+    fn walk(nodes: &[RunTreeNode], depth: usize, best: &mut Option<(usize, u64, String)>) {
         for node in nodes {
-            if node.span.status == SpanStatus::Failed
-                && best.as_ref().is_none_or(|(d, _)| depth > *d)
-            {
-                *best = Some((depth, node.span.span_id.0.clone()));
+            let should_replace = node.span.status == SpanStatus::Failed
+                && best
+                    .as_ref()
+                    .is_none_or(|(best_depth, best_started_at, _)| {
+                        depth > *best_depth
+                            || (depth == *best_depth && node.span.started_at > *best_started_at)
+                    });
+            if should_replace {
+                *best = Some((depth, node.span.started_at, node.span.span_id.0.clone()));
             }
             walk(&node.children, depth + 1, best);
         }
     }
     let mut best = None;
     walk(nodes, 0, &mut best);
-    best.map(|(_, id)| id)
+    best.map(|(_, _, id)| id)
 }
 
 fn timeline_depth(
@@ -414,7 +419,8 @@ fn find_deepest_failing_dep(
                 .or_else(|| Some((1, dependency_id.0.clone())));
 
             if candidate.as_ref().is_some_and(|(depth, _)| {
-                best.as_ref().is_none_or(|(best_depth, _)| depth > best_depth)
+                best.as_ref()
+                    .is_none_or(|(best_depth, _)| depth > best_depth)
             }) {
                 best = candidate;
             }

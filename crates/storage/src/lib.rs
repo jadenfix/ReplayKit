@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::Duration;
 
 use replaykit_core_model::{
@@ -777,6 +778,8 @@ impl Storage for InMemoryStorage {
 }
 
 const SQLITE_SCHEMA_VERSION: i32 = 1;
+const SQLITE_OPEN_RETRY_ATTEMPTS: usize = 40;
+const SQLITE_OPEN_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS id_counters (
@@ -923,8 +926,7 @@ impl SqliteStorage {
             db_path: Arc::new(db_path),
             blob_store: None,
         };
-        let mut conn = Connection::open(storage.db_path.as_ref()).map_err(map_sqlite_error)?;
-        initialize_sqlite(&mut conn)?;
+        open_and_initialize_sqlite(storage.db_path.as_ref())?;
         tracing::info!(db_path = %storage.db_path.display(), "opened sqlite storage");
         Ok(storage)
     }
@@ -949,8 +951,7 @@ impl SqliteStorage {
             db_path: Arc::new(db_path),
             blob_store: Some(blob_store),
         };
-        let mut conn = Connection::open(storage.db_path.as_ref()).map_err(map_sqlite_error)?;
-        initialize_sqlite(&mut conn)?;
+        open_and_initialize_sqlite(storage.db_path.as_ref())?;
         tracing::info!(
             db_path = %storage.db_path.display(),
             data_root = %data_root.display(),
@@ -1056,6 +1057,51 @@ fn configure_sqlite_connection(conn: &Connection) -> Result<(), StorageError> {
     )
     .map_err(map_sqlite_error)?;
     Ok(())
+}
+
+fn open_and_initialize_sqlite(db_path: &Path) -> Result<(), StorageError> {
+    let mut last_err = None;
+
+    for attempt in 1..=SQLITE_OPEN_RETRY_ATTEMPTS {
+        let result = (|| {
+            let mut conn = Connection::open(db_path).map_err(map_sqlite_error)?;
+            initialize_sqlite(&mut conn)
+        })();
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_retryable_startup_error(&err) && attempt < SQLITE_OPEN_RETRY_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = SQLITE_OPEN_RETRY_ATTEMPTS,
+                    db_path = %db_path.display(),
+                    error = %err,
+                    "sqlite startup hit a transient lock; retrying"
+                );
+                last_err = Some(err);
+                thread::sleep(SQLITE_OPEN_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        StorageError::Internal(format!(
+            "failed to initialize sqlite storage at {} for an unknown reason",
+            db_path.display()
+        ))
+    }))
+}
+
+fn is_retryable_startup_error(error: &StorageError) -> bool {
+    match error {
+        StorageError::Internal(message) => {
+            message.contains("database is locked") || message.contains("database is busy")
+        }
+        _ => false,
+    }
 }
 
 fn initialize_sqlite(conn: &mut Connection) -> Result<(), StorageError> {
