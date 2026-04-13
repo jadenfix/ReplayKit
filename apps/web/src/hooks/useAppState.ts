@@ -13,8 +13,8 @@ import type { ReplayKitProvider } from '../providers';
 type Action =
   | { type: 'RUNS_LOADING' }
   | { type: 'RUNS_LOADED'; runs: RunListItem[] }
-  | { type: 'TREE_LOADED'; tree: SpanTreeNode | null; run: RunRecord | null; branches: BranchRecord[]; edges: SpanEdgeRecord[] }
-  | { type: 'SPAN_LOADED'; span: SpanRecord | null; artifacts: ArtifactRecord[]; edges: SpanEdgeRecord[] }
+  | { type: 'TREE_LOADED'; runId: string; tree: SpanTreeNode | null; run: RunRecord | null; branches: BranchRecord[]; edges: SpanEdgeRecord[] }
+  | { type: 'SPAN_LOADED'; runId: string; spanId: string; span: SpanRecord | null; artifacts: ArtifactRecord[]; edges: SpanEdgeRecord[] }
   | { type: 'SELECT_RUN'; runId: string }
   | { type: 'SELECT_SPAN'; spanId: string }
   | { type: 'SET_BOTTOM_TAB'; tab: BottomTab }
@@ -24,8 +24,9 @@ type Action =
   | { type: 'BRANCH_CREATED'; branch: BranchRecord }
   | { type: 'DIFF_LOADED'; diff: DiffSummary | null }
   | { type: 'SET_CENTER_VIEW'; view: CenterView }
-  | { type: 'TIMELINE_LOADED'; timeline: TimelineView | null }
-  | { type: 'FORENSICS_LOADED'; forensics: ForensicsReport | null };
+  | { type: 'TIMELINE_LOADED'; runId: string; timeline: TimelineView | null }
+  | { type: 'FORENSICS_LOADED'; runId: string; forensics: ForensicsReport | null }
+  | { type: 'SET_ERROR'; error: string | null };
 
 // ── Initial state ───────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ const INIT: AppState = {
   centerView: 'tree',
   timeline: null,
   forensics: null,
+  error: null,
   loading: { runs: true, tree: false, detail: false, timeline: false },
 };
 
@@ -69,9 +71,11 @@ function reducer(state: AppState, action: Action): AppState {
         diffSummary: null,
         branchDraft: null,
         centerView: 'tree',
+        error: null,
         loading: { ...state.loading, tree: true, timeline: true },
       };
     case 'TREE_LOADED':
+      if (action.runId !== state.selectedRunId) return state;
       return {
         ...state,
         runTree: action.tree,
@@ -87,6 +91,7 @@ function reducer(state: AppState, action: Action): AppState {
         loading: { ...state.loading, detail: true },
       };
     case 'SPAN_LOADED':
+      if (action.runId !== state.selectedRunId || action.spanId !== state.selectedSpanId) return state;
       return {
         ...state,
         spanDetail: action.span,
@@ -127,9 +132,13 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_CENTER_VIEW':
       return { ...state, centerView: action.view };
     case 'TIMELINE_LOADED':
+      if (action.runId !== state.selectedRunId) return state;
       return { ...state, timeline: action.timeline, loading: { ...state.loading, timeline: false } };
     case 'FORENSICS_LOADED':
+      if (action.runId !== state.selectedRunId) return state;
       return { ...state, forensics: action.forensics };
+    case 'SET_ERROR':
+      return { ...state, error: action.error };
     default:
       return state;
   }
@@ -155,6 +164,7 @@ export function useAppState(provider: ReplayKitProvider) {
       dispatch({ type: 'RUNS_LOADED', runs });
     }).catch(err => {
       console.error('Failed to load runs:', err);
+      dispatch({ type: 'SET_ERROR', error: 'Failed to load runs. Check API connection.' });
       dispatch({ type: 'RUNS_LOADED', runs: [] });
     });
   }, [provider]);
@@ -169,10 +179,11 @@ export function useAppState(provider: ReplayKitProvider) {
       provider.getBranches(runId),
       provider.getSpanEdges(runId),
     ]).then(([tree, run, branches, edges]) => {
-      dispatch({ type: 'TREE_LOADED', tree, run, branches, edges });
+      dispatch({ type: 'TREE_LOADED', runId, tree, run, branches, edges });
     }).catch(err => {
       console.error('Failed to load run tree:', err);
-      dispatch({ type: 'TREE_LOADED', tree: null, run: null, branches: [], edges: [] });
+      dispatch({ type: 'SET_ERROR', error: 'Failed to load run tree. Check API connection.' });
+      dispatch({ type: 'TREE_LOADED', runId, tree: null, run: null, branches: [], edges: [] });
     });
   }, [provider, state.selectedRunId]);
 
@@ -181,9 +192,11 @@ export function useAppState(provider: ReplayKitProvider) {
     if (!state.selectedRunId) return;
     const runId = state.selectedRunId;
     provider.getTimeline(runId).then(timeline => {
-      dispatch({ type: 'TIMELINE_LOADED', timeline });
-    }).catch(() => {
-      dispatch({ type: 'TIMELINE_LOADED', timeline: null });
+      dispatch({ type: 'TIMELINE_LOADED', runId, timeline });
+    }).catch(err => {
+      console.error('Failed to load timeline:', err);
+      dispatch({ type: 'SET_ERROR', error: 'Failed to load timeline.' });
+      dispatch({ type: 'TIMELINE_LOADED', runId, timeline: null });
     });
   }, [provider, state.selectedRunId]);
 
@@ -192,9 +205,11 @@ export function useAppState(provider: ReplayKitProvider) {
     if (!state.selectedRunId) return;
     const runId = state.selectedRunId;
     provider.getForensics(runId).then(forensics => {
-      dispatch({ type: 'FORENSICS_LOADED', forensics });
-    }).catch(() => {
-      dispatch({ type: 'FORENSICS_LOADED', forensics: null });
+      dispatch({ type: 'FORENSICS_LOADED', runId, forensics });
+    }).catch(err => {
+      console.error('Failed to load forensics:', err);
+      dispatch({ type: 'SET_ERROR', error: 'Failed to load forensics.' });
+      dispatch({ type: 'FORENSICS_LOADED', runId, forensics: null });
     });
   }, [provider, state.selectedRunId]);
 
@@ -208,10 +223,11 @@ export function useAppState(provider: ReplayKitProvider) {
       provider.getSpanArtifacts(runId, spanId),
       provider.getSpanEdges(runId),
     ]).then(([span, artifacts, edges]) => {
-      dispatch({ type: 'SPAN_LOADED', span, artifacts, edges });
+      dispatch({ type: 'SPAN_LOADED', runId, spanId, span, artifacts, edges });
     }).catch(err => {
       console.error('Failed to load span detail:', err);
-      dispatch({ type: 'SPAN_LOADED', span: null, artifacts: [], edges: [] });
+      dispatch({ type: 'SET_ERROR', error: 'Failed to load span detail.' });
+      dispatch({ type: 'SPAN_LOADED', runId, spanId, span: null, artifacts: [], edges: [] });
     });
   }, [provider, state.selectedRunId, state.selectedSpanId]);
 
@@ -258,6 +274,10 @@ export function useAppState(provider: ReplayKitProvider) {
     dispatch({ type: 'SET_CENTER_VIEW', view });
   }, []);
 
+  const clearError = useCallback(() => {
+    dispatch({ type: 'SET_ERROR', error: null });
+  }, []);
+
   return {
     state,
     selectRun,
@@ -270,5 +290,6 @@ export function useAppState(provider: ReplayKitProvider) {
     loadDiff,
     jumpToSpan,
     setCenterView,
+    clearError,
   };
 }

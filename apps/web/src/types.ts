@@ -139,10 +139,10 @@ export interface DiffSummary {
   diff_id: string;
   source_run_id: string;
   target_run_id: string;
-  first_divergent_span_id: string;
-  status_change: { from: RunStatus; to: RunStatus };
-  latency_ms_delta: number;
-  token_delta: number;
+  first_divergent_span_id: string | null;
+  status_change: { from: RunStatus; to: RunStatus } | null;
+  latency_ms_delta: number | null;
+  token_delta: number | null;
   changed_span_count: number;
   changed_artifact_count: number;
   final_output_changed: boolean;
@@ -240,5 +240,6 @@ export interface AppState {
   centerView: CenterView;
   timeline: TimelineView | null;
   forensics: ForensicsReport | null;
+  error: string | null;
   loading: { runs: boolean; tree: boolean; detail: boolean; timeline: boolean };
 }

@@ -18,6 +18,9 @@ export function DiffSummaryPanel({ diff, onJumpToSpan }: DiffSummaryProps) {
     );
   }
 
+  const latency = diff.latency_ms_delta ?? 0;
+  const tokens = diff.token_delta ?? 0;
+
   return (
     <div className="diff-panel" data-testid="diff-panel">
       <div className="diff-panel__header">
@@ -29,14 +32,16 @@ export function DiffSummaryPanel({ diff, onJumpToSpan }: DiffSummaryProps) {
 
       {/* Summary cards */}
       <div className="diff-panel__summary">
-        <div className="diff-card diff-card--status">
-          <div className="diff-card__label">Status</div>
-          <div className="diff-card__value">
-            <StatusBadge status={diff.status_change.from} />
-            <span className="diff-card__arrow">{'\u2192'}</span>
-            <StatusBadge status={diff.status_change.to} />
+        {diff.status_change && (
+          <div className="diff-card diff-card--status">
+            <div className="diff-card__label">Status</div>
+            <div className="diff-card__value">
+              <StatusBadge status={diff.status_change.from} />
+              <span className="diff-card__arrow">{'\u2192'}</span>
+              <StatusBadge status={diff.status_change.to} />
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="diff-card">
           <div className="diff-card__label">Changed Spans</div>
@@ -48,17 +53,17 @@ export function DiffSummaryPanel({ diff, onJumpToSpan }: DiffSummaryProps) {
           <div className="diff-card__value diff-card__value--number">{diff.changed_artifact_count}</div>
         </div>
 
-        <div className={`diff-card ${diff.latency_ms_delta < 0 ? 'diff-card--positive' : 'diff-card--negative'}`}>
+        <div className={`diff-card ${latency < 0 ? 'diff-card--positive' : 'diff-card--negative'}`}>
           <div className="diff-card__label">Latency Delta</div>
           <div className="diff-card__value diff-card__value--number">
-            {diff.latency_ms_delta > 0 ? '+' : diff.latency_ms_delta < 0 ? '-' : ''}{formatDuration(Math.abs(diff.latency_ms_delta))}
+            {latency > 0 ? '+' : latency < 0 ? '-' : ''}{formatDuration(Math.abs(latency))}
           </div>
         </div>
 
         <div className="diff-card">
           <div className="diff-card__label">Token Delta</div>
           <div className="diff-card__value diff-card__value--number">
-            {diff.token_delta > 0 ? '+' : ''}{diff.token_delta}
+            {tokens > 0 ? '+' : ''}{tokens}
           </div>
         </div>
 
@@ -69,10 +74,10 @@ export function DiffSummaryPanel({ diff, onJumpToSpan }: DiffSummaryProps) {
       </div>
 
       {/* First divergence - prominent CTA */}
-      {diff.first_divergent_span_id && (
+      {diff.first_divergent_span_id != null && (
         <button
           className="diff-panel__divergence-cta"
-          onClick={() => onJumpToSpan(diff.first_divergent_span_id)}
+          onClick={() => onJumpToSpan(diff.first_divergent_span_id!)}
         >
           <span>{'\u2192'}</span>
           Jump to first divergent span: <strong>{diff.first_divergent_span_id}</strong>
