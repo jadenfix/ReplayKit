@@ -430,6 +430,7 @@ mod tests {
                     summary: summary_from_pairs(&[("tool", "initial tool output")]),
                     redaction: Document::new(),
                     created_at: 4,
+                    content: None,
                 },
             )
             .unwrap();
@@ -483,6 +484,7 @@ mod tests {
                     summary: summary_from_pairs(&[("answer", "failed answer")]),
                     redaction: Document::new(),
                     created_at: 6,
+                    content: None,
                 },
             )
             .unwrap();

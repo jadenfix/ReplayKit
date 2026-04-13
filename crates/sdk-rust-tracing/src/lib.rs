@@ -63,6 +63,7 @@ impl<S: Storage> SemanticSession<S> {
                 summary,
                 redaction: Document::new(),
                 created_at,
+                content: None,
             },
         )
     }

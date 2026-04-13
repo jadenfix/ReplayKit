@@ -1,3 +1,5 @@
+pub mod blob;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -7,12 +9,14 @@ use std::time::Duration;
 
 use replaykit_core_model::{
     ArtifactId, ArtifactRecord, BranchId, BranchRecord, DirtySpanRecord, EventRecord, IdKind,
-    ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId, RunRecord, SnapshotId, SnapshotRecord,
-    SpanEdgeRecord, SpanId, SpanRecord,
+    ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId, RunRecord, RunStatus, SnapshotId,
+    SnapshotRecord, SpanEdgeRecord, SpanId, SpanRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+pub use blob::{BlobIntegrity, BlobRef, BlobStore, InMemoryBlobStore, LocalBlobStore, sha256_hex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -32,6 +36,8 @@ impl fmt::Display for StorageError {
         }
     }
 }
+
+impl std::error::Error for StorageError {}
 
 pub trait Storage: Send + Sync {
     fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError>;
@@ -77,10 +83,40 @@ pub trait Storage: Send + Sync {
     fn insert_diff(&self, diff: RunDiffRecord) -> Result<(), StorageError>;
     fn get_diff(&self, source: &RunId, target: &RunId) -> Result<RunDiffRecord, StorageError>;
 
+    /// Store an artifact together with its binary content. The implementation
+    /// writes the content to a blob store first, then inserts the metadata.
+    fn store_artifact_with_content(
+        &self,
+        artifact: ArtifactRecord,
+        content: &[u8],
+    ) -> Result<ArtifactRecord, StorageError>;
+
+    /// Read the binary content of a previously stored artifact.
+    fn read_artifact_content(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<Vec<u8>, StorageError>;
+
+    /// Verify the on-disk integrity of an artifact's blob.
+    fn verify_artifact_integrity(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<BlobIntegrity, StorageError>;
+
     fn dirty_spans_for_run(&self, run_id: &RunId) -> Result<Vec<DirtySpanRecord>, StorageError> {
         let _ = run_id;
         Ok(Vec::new())
     }
+}
+
+/// Report produced by an integrity scan for a single artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactIntegrityReport {
+    pub artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub status: BlobIntegrity,
 }
 
 #[derive(Default)]
@@ -101,11 +137,16 @@ struct MemoryState {
 #[derive(Clone, Default)]
 pub struct InMemoryStorage {
     state: Arc<RwLock<MemoryState>>,
+    blob_store: InMemoryBlobStore,
 }
 
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn blob_store(&self) -> &InMemoryBlobStore {
+        &self.blob_store
     }
 
     fn ensure_run_exists(state: &MemoryState, run_id: &RunId) -> Result<(), StorageError> {
@@ -681,6 +722,49 @@ impl Storage for InMemoryStorage {
                 ))
             })
     }
+
+    fn store_artifact_with_content(
+        &self,
+        mut artifact: ArtifactRecord,
+        content: &[u8],
+    ) -> Result<ArtifactRecord, StorageError> {
+        let blob_ref = self.blob_store.store(content)?;
+        artifact.sha256 = blob_ref.sha256.clone();
+        artifact.byte_len = blob_ref.byte_len as usize;
+        artifact.blob_path = self
+            .blob_store
+            .blob_path(&blob_ref)
+            .to_string_lossy()
+            .to_string();
+        self.insert_artifact(artifact.clone())?;
+        Ok(artifact)
+    }
+
+    fn read_artifact_content(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<Vec<u8>, StorageError> {
+        let artifact = self.get_artifact(run_id, artifact_id)?;
+        let blob_ref = BlobRef {
+            sha256: artifact.sha256,
+            byte_len: artifact.byte_len as u64,
+        };
+        self.blob_store.read(&blob_ref)
+    }
+
+    fn verify_artifact_integrity(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<BlobIntegrity, StorageError> {
+        let artifact = self.get_artifact(run_id, artifact_id)?;
+        let blob_ref = BlobRef {
+            sha256: artifact.sha256,
+            byte_len: artifact.byte_len as u64,
+        };
+        self.blob_store.verify(&blob_ref)
+    }
 }
 
 const SQLITE_SCHEMA_VERSION: i32 = 1;
@@ -811,6 +895,7 @@ CREATE TABLE edges (
 #[derive(Clone, Debug)]
 pub struct SqliteStorage {
     db_path: Arc<PathBuf>,
+    blob_store: Option<LocalBlobStore>,
 }
 
 impl SqliteStorage {
@@ -827,14 +912,50 @@ impl SqliteStorage {
 
         let storage = Self {
             db_path: Arc::new(db_path),
+            blob_store: None,
         };
         let mut conn = Connection::open(storage.db_path.as_ref()).map_err(map_sqlite_error)?;
         initialize_sqlite(&mut conn)?;
+        tracing::info!(db_path = %storage.db_path.display(), "opened sqlite storage");
+        Ok(storage)
+    }
+
+    /// Open storage with a managed blob store rooted at `data_root`.
+    /// The SQLite database is placed at `{data_root}/replaykit.db`.
+    pub fn open_with_data_root(data_root: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let data_root = data_root.into();
+        let db_path = data_root.join("replaykit.db");
+        let blob_store = LocalBlobStore::open(&data_root)?;
+
+        if let Some(parent) = db_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                StorageError::Internal(format!(
+                    "failed to create sqlite storage directory {:?}: {err}",
+                    parent
+                ))
+            })?;
+        }
+
+        let storage = Self {
+            db_path: Arc::new(db_path),
+            blob_store: Some(blob_store),
+        };
+        let mut conn = Connection::open(storage.db_path.as_ref()).map_err(map_sqlite_error)?;
+        initialize_sqlite(&mut conn)?;
+        tracing::info!(
+            db_path = %storage.db_path.display(),
+            data_root = %data_root.display(),
+            "opened sqlite storage with blob store"
+        );
         Ok(storage)
     }
 
     pub fn db_path(&self) -> &Path {
         self.db_path.as_ref()
+    }
+
+    pub fn blob_store(&self) -> Option<&LocalBlobStore> {
+        self.blob_store.as_ref()
     }
 
     fn with_connection<T>(
@@ -1569,6 +1690,177 @@ impl Storage for SqliteStorage {
             decode_json(&payload)
         })
     }
+
+    fn store_artifact_with_content(
+        &self,
+        mut artifact: ArtifactRecord,
+        content: &[u8],
+    ) -> Result<ArtifactRecord, StorageError> {
+        let blob_store = self.blob_store.as_ref().ok_or_else(|| {
+            StorageError::Internal("cannot store artifact content: no blob store configured".into())
+        })?;
+
+        // Store blob first (safe orphan on DB failure).
+        let blob_ref = blob_store.store(content)?;
+        artifact.sha256 = blob_ref.sha256.clone();
+        artifact.byte_len = blob_ref.byte_len as usize;
+        artifact.blob_path = blob_store
+            .blob_path(&blob_ref)
+            .to_string_lossy()
+            .to_string();
+
+        self.insert_artifact(artifact.clone())?;
+        Ok(artifact)
+    }
+
+    fn read_artifact_content(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<Vec<u8>, StorageError> {
+        let blob_store = self.blob_store.as_ref().ok_or_else(|| {
+            StorageError::Internal("cannot read artifact content: no blob store configured".into())
+        })?;
+        let artifact = self.get_artifact(run_id, artifact_id)?;
+        let blob_ref = BlobRef {
+            sha256: artifact.sha256,
+            byte_len: artifact.byte_len as u64,
+        };
+        blob_store.read(&blob_ref)
+    }
+
+    fn verify_artifact_integrity(
+        &self,
+        run_id: &RunId,
+        artifact_id: &ArtifactId,
+    ) -> Result<BlobIntegrity, StorageError> {
+        let blob_store = self.blob_store.as_ref().ok_or_else(|| {
+            StorageError::Internal(
+                "cannot verify artifact integrity: no blob store configured".into(),
+            )
+        })?;
+        // Fetch artifact metadata without blob-path validation (the blob may
+        // be missing/corrupt, which is exactly what we're checking).
+        let artifact: ArtifactRecord = self.with_connection(|conn| {
+            let payload = conn
+                .query_row(
+                    "SELECT payload_json FROM artifacts WHERE run_id = ?1 AND artifact_id = ?2",
+                    params![run_id.0, artifact_id.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    StorageError::NotFound(format!(
+                        "artifact {:?} for run {:?} not found",
+                        artifact_id.0, run_id.0
+                    ))
+                })?;
+            decode_json(&payload)
+        })?;
+        let blob_ref = BlobRef {
+            sha256: artifact.sha256,
+            byte_len: artifact.byte_len as u64,
+        };
+        blob_store.verify(&blob_ref)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery and integrity scanning (SqliteStorage)
+// ---------------------------------------------------------------------------
+
+impl SqliteStorage {
+    /// Mark all runs with status == Running as Interrupted.
+    /// Returns the list of affected run IDs.
+    pub fn recover_interrupted_runs(&self) -> Result<Vec<RunId>, StorageError> {
+        self.with_connection(|conn| {
+            // Find all runs currently in Running state.
+            let mut stmt = conn
+                .prepare("SELECT payload_json FROM runs")
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+
+            let mut affected = Vec::new();
+            for row in rows {
+                let payload = row.map_err(map_sqlite_error)?;
+                let run: RunRecord = decode_json(&payload)?;
+                if run.status == RunStatus::Running {
+                    affected.push(run.run_id.clone());
+                    let mut updated = run;
+                    updated.status = RunStatus::Interrupted;
+                    let new_payload = encode_json(&updated)?;
+                    conn.execute(
+                        "UPDATE runs SET payload_json = ?2 WHERE run_id = ?1",
+                        params![updated.run_id.0, new_payload],
+                    )
+                    .map_err(map_sqlite_error)?;
+                }
+            }
+
+            if !affected.is_empty() {
+                tracing::warn!(
+                    count = affected.len(),
+                    "marked running runs as interrupted during recovery"
+                );
+            }
+
+            Ok(affected)
+        })
+    }
+
+    /// Scan all artifacts and verify their blob integrity.
+    /// Returns a report for every artifact that is NOT valid.
+    pub fn scan_artifact_integrity(&self) -> Result<Vec<ArtifactIntegrityReport>, StorageError> {
+        let blob_store = self.blob_store.as_ref().ok_or_else(|| {
+            StorageError::Internal(
+                "cannot scan artifact integrity: no blob store configured".into(),
+            )
+        })?;
+
+        self.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT payload_json FROM artifacts")
+                .map_err(map_sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(map_sqlite_error)?;
+
+            let mut reports = Vec::new();
+            for row in rows {
+                let payload = row.map_err(map_sqlite_error)?;
+                let artifact: ArtifactRecord = decode_json(&payload)?;
+
+                // Only verify artifacts whose blob_path is managed by us.
+                if artifact.blob_path.starts_with("memory://") || artifact.blob_path.contains("://")
+                {
+                    continue;
+                }
+
+                let blob_ref = BlobRef {
+                    sha256: artifact.sha256,
+                    byte_len: artifact.byte_len as u64,
+                };
+                let status = blob_store.verify(&blob_ref)?;
+                if status != BlobIntegrity::Valid {
+                    tracing::warn!(
+                        artifact_id = %artifact.artifact_id.0,
+                        run_id = %artifact.run_id.0,
+                        status = ?status,
+                        "artifact integrity failure"
+                    );
+                    reports.push(ArtifactIntegrityReport {
+                        artifact_id: artifact.artifact_id,
+                        run_id: artifact.run_id,
+                        status,
+                    });
+                }
+            }
+            Ok(reports)
+        })
+    }
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<String, StorageError> {
@@ -1997,5 +2289,342 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("replaykit-blob-{label}-{nonce}"))
+    }
+
+    fn unique_data_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("replaykit-data-{label}-{nonce}"))
+    }
+
+    // ---- Phase 3 tests: artifact + blob coherence ----
+
+    #[test]
+    fn sqlite_artifact_with_content_round_trip() {
+        let data_root = unique_data_root("artifact-content-rt");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"hello, managed blob!";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-content-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(), // will be set by store
+            byte_len: 0,           // will be set by store
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        assert_eq!(stored.byte_len, content.len());
+        assert_eq!(stored.sha256, blob::sha256_hex(content));
+        assert!(!stored.blob_path.is_empty());
+
+        // Read content back.
+        let read_back = storage
+            .read_artifact_content(&run.run_id, &stored.artifact_id)
+            .unwrap();
+        assert_eq!(read_back, content);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn sqlite_artifact_integrity_valid() {
+        let data_root = unique_data_root("integrity-valid");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"check my integrity";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-int-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+        let integrity = storage
+            .verify_artifact_integrity(&run.run_id, &stored.artifact_id)
+            .unwrap();
+        assert_eq!(integrity, BlobIntegrity::Valid);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn sqlite_integrity_error_when_blob_deleted() {
+        let data_root = unique_data_root("integrity-deleted");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"delete me later";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-del-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        // Delete the blob.
+        fs::remove_file(&stored.blob_path).unwrap();
+
+        let integrity = storage
+            .verify_artifact_integrity(&run.run_id, &stored.artifact_id)
+            .unwrap();
+        assert_eq!(integrity, BlobIntegrity::Missing);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn sqlite_integrity_error_when_blob_mutated() {
+        let data_root = unique_data_root("integrity-mutated");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"mutate me later";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-mut-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        // Overwrite blob with same size but different content.
+        fs::write(&stored.blob_path, b"MUTATE ME LATER").unwrap();
+
+        let integrity = storage
+            .verify_artifact_integrity(&run.run_id, &stored.artifact_id)
+            .unwrap();
+        match integrity {
+            BlobIntegrity::HashMismatch { .. } => {} // expected
+            other => panic!("expected HashMismatch, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn inmemory_artifact_with_content_round_trip() {
+        let storage = InMemoryStorage::new();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"in-memory artifact content";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-mem-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        let read_back = storage
+            .read_artifact_content(&run.run_id, &stored.artifact_id)
+            .unwrap();
+        assert_eq!(read_back, content);
+    }
+
+    #[test]
+    fn dedup_two_artifacts_same_content_share_one_blob() {
+        let data_root = unique_data_root("dedup-artifact");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"shared content";
+        let art1 = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-dup-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let art2 = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-dup-2".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 2,
+        };
+
+        let stored1 = storage.store_artifact_with_content(art1, content).unwrap();
+        let stored2 = storage.store_artifact_with_content(art2, content).unwrap();
+
+        // Same blob path (content-addressed dedup).
+        assert_eq!(stored1.blob_path, stored2.blob_path);
+        assert_eq!(stored1.sha256, stored2.sha256);
+        // But different artifact IDs.
+        assert_ne!(stored1.artifact_id, stored2.artifact_id);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    // ---- Phase 5 tests: recovery and integrity scanning ----
+
+    #[test]
+    fn recover_marks_running_runs_as_interrupted() {
+        let data_root = unique_data_root("recovery");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+
+        let mut run1 = sample_run();
+        run1.run_id = RunId("run-recovery-1".into());
+        run1.status = RunStatus::Running;
+        storage.insert_run(run1.clone()).unwrap();
+
+        let mut run2 = sample_run();
+        run2.run_id = RunId("run-recovery-2".into());
+        run2.status = RunStatus::Completed;
+        storage.insert_run(run2.clone()).unwrap();
+
+        let affected = storage.recover_interrupted_runs().unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0], run1.run_id);
+
+        let recovered = storage.get_run(&run1.run_id).unwrap();
+        assert_eq!(recovered.status, RunStatus::Interrupted);
+
+        // Run2 remains completed.
+        let unchanged = storage.get_run(&run2.run_id).unwrap();
+        assert_eq!(unchanged.status, RunStatus::Completed);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn scan_integrity_surfaces_missing_blob() {
+        let data_root = unique_data_root("scan-missing");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"scan test blob";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-scan-1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        // Delete the blob file.
+        fs::remove_file(&stored.blob_path).unwrap();
+
+        let reports = storage.scan_artifact_integrity().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].artifact_id, stored.artifact_id);
+        assert_eq!(reports[0].status, BlobIntegrity::Missing);
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn scan_integrity_surfaces_hash_mismatch() {
+        let data_root = unique_data_root("scan-hash");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let run = sample_run();
+        storage.insert_run(run.clone()).unwrap();
+
+        let content = b"hash scan test";
+        let artifact = ArtifactRecord {
+            artifact_id: ArtifactId("artifact-scan-h1".into()),
+            run_id: run.run_id.clone(),
+            span_id: None,
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "text/plain".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let stored = storage
+            .store_artifact_with_content(artifact, content)
+            .unwrap();
+
+        // Corrupt blob with same-length content.
+        fs::write(&stored.blob_path, b"HASH SCAN TEST").unwrap();
+
+        let reports = storage.scan_artifact_integrity().unwrap();
+        assert_eq!(reports.len(), 1);
+        match &reports[0].status {
+            BlobIntegrity::HashMismatch { .. } => {} // expected
+            other => panic!("expected HashMismatch, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&data_root);
     }
 }
