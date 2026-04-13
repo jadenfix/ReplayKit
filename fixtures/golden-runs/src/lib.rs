@@ -186,6 +186,8 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
         .record_completed_span(
             shell_command("cargo test")
                 .command("cargo test --test auth")
+                .cwd("/workspace/project")
+                .timeout_ms(30_000)
                 .span_id("shell-001")
                 .parent(&planner.span_id)
                 .times(141, 160)
@@ -336,6 +338,8 @@ pub fn generate_success_coding_agent() -> FixtureRun {
         .record_completed_span(
             shell_command("cargo test")
                 .command("cargo test --test auth")
+                .cwd("/workspace/project")
+                .timeout_ms(30_000)
                 .span_id("shell-001")
                 .parent(&planner.span_id)
                 .times(241, 260)
@@ -415,6 +419,111 @@ pub fn generate_simple_recorded() -> FixtureRun {
         .unwrap();
 
     let run = session.finish(321, RunStatus::Completed).unwrap();
+
+    let (spans, artifacts, edges, snapshots) = extract(&storage, &run_id);
+    FixtureRun {
+        run,
+        spans,
+        artifacts,
+        edges,
+        snapshots,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Coding-agent with missing file write content (contract violation)
+// ---------------------------------------------------------------------------
+
+/// Same as the failed coding-agent, but the file_write span omits
+/// `.write_content()`. Used to prove that the tightened contract blocks replay.
+pub fn generate_missing_content_fixture() -> FixtureRun {
+    let storage = Arc::new(InMemoryStorage::new());
+    let session = SemanticSession::start(
+        storage.clone(),
+        "missing content fixture",
+        "agent.main",
+        400,
+    )
+    .unwrap();
+    let run_id = session.run().run_id.clone();
+
+    let planner = session
+        .record_completed_span(
+            planner_step("plan fix")
+                .span_id("planner-001")
+                .times(400, 410)
+                .output(
+                    ArtifactType::DebugLog,
+                    summary_from_pairs(&[("plan", "read test, generate fix, apply, verify")]),
+                )
+                .output_fingerprint("plan-v1")
+                .build(),
+        )
+        .unwrap();
+
+    let llm = session
+        .record_completed_span(
+            model_call("generate fix")
+                .provider("anthropic")
+                .model("claude-sonnet-4-6")
+                .model_request_json(
+                    r#"{"messages":[{"role":"user","content":"fix the failing auth test"}]}"#,
+                )
+                .span_id("llm-001")
+                .parent(&planner.span_id)
+                .times(411, 425)
+                .executor("claude-sonnet-4-6", "2025-05-14")
+                .output(
+                    ArtifactType::ModelResponse,
+                    summary_from_pairs(&[("response_tokens", "350")]),
+                )
+                .output_fingerprint("response-hash-ghi789")
+                .cost(1200, 350, 4500)
+                .build(),
+        )
+        .unwrap();
+
+    // File write WITHOUT .write_content() — this should block replay.
+    let fwrite = session
+        .record_completed_span(
+            file_write("apply patch")
+                .path("tests/test_auth.rs")
+                // Intentionally omitting .write_content()
+                .span_id("file-write-001")
+                .parent(&planner.span_id)
+                .times(426, 435)
+                .output(
+                    ArtifactType::FileDiff,
+                    summary_from_pairs(&[("path", "tests/test_auth.rs"), ("lines_changed", "5")]),
+                )
+                .output_fingerprint("diff-hash-jkl012")
+                .build(),
+        )
+        .unwrap();
+
+    session
+        .add_dependency(fwrite.span_id.clone(), llm.span_id.clone())
+        .unwrap();
+
+    let shell = session
+        .record_completed_span(
+            shell_command("cargo test")
+                .command("cargo test --test auth")
+                .cwd("/workspace/project")
+                .span_id("shell-001")
+                .parent(&planner.span_id)
+                .times(436, 450)
+                .executor("shell", "bash-5.2")
+                .failed("cargo test exited with code 1")
+                .build(),
+        )
+        .unwrap();
+
+    session
+        .add_dependency(shell.span_id.clone(), fwrite.span_id.clone())
+        .unwrap();
+
+    let run = session.finish(451, RunStatus::Failed).unwrap();
 
     let (spans, artifacts, edges, snapshots) = extract(&storage, &run_id);
     FixtureRun {
@@ -691,5 +800,307 @@ mod tests {
 
         assert_ne!(f_shell.status, s_shell.status);
         assert_ne!(f_shell.output_fingerprint, s_shell.output_fingerprint);
+    }
+
+    // -- Replay regression tests ---------------------------------------------
+
+    fn load_fixture_into_storage(fixture: &FixtureRun) -> Arc<InMemoryStorage> {
+        let storage = Arc::new(InMemoryStorage::new());
+        storage.insert_run(fixture.run.clone()).unwrap();
+        for span in &fixture.spans {
+            storage.upsert_span(span.clone()).unwrap();
+        }
+        for artifact in &fixture.artifacts {
+            storage.insert_artifact(artifact.clone()).unwrap();
+        }
+        for edge in &fixture.edges {
+            storage.insert_edge(edge.clone()).unwrap();
+        }
+        // Advance ID counters past fixture-allocated IDs.
+        use replaykit_core_model::IdKind;
+        for kind in [
+            IdKind::Run,
+            IdKind::Trace,
+            IdKind::Branch,
+            IdKind::ReplayJob,
+            IdKind::Diff,
+            IdKind::Snapshot,
+            IdKind::Event,
+        ] {
+            let _ = storage.allocate_id(kind);
+        }
+        for _ in 0..fixture.artifacts.len() + 5 {
+            let _ = storage.allocate_id(IdKind::Artifact);
+        }
+        for _ in 0..fixture.edges.len() + 5 {
+            let _ = storage.allocate_id(IdKind::Edge);
+        }
+        storage
+    }
+
+    fn make_branch_request(
+        source_run_id: &RunId,
+        fork_span_id: &str,
+    ) -> replaykit_core_model::BranchRequest {
+        use replaykit_core_model::{BranchRequest, PatchManifest, PatchType, Value};
+        BranchRequest {
+            source_run_id: source_run_id.clone(),
+            fork_span_id: SpanId(fork_span_id.into()),
+            patch_manifest: PatchManifest {
+                patch_type: PatchType::PromptEdit,
+                target_artifact_id: None,
+                replacement: Value::Text("test patch".into()),
+                note: Some("regression test".into()),
+                created_at: 900,
+            },
+            created_by: Some("test".into()),
+        }
+    }
+
+    #[test]
+    fn selective_rerun_only_reruns_dirty_descendants() {
+        use replaykit_replay_engine::ReplayEngine;
+        use replaykit_replay_engine::executors::{
+            CompositeExecutorRegistry, FakeModelExecutor, ModelExecutorMode,
+        };
+
+        let fixture = generate_failed_coding_agent();
+        let storage = load_fixture_into_storage(&fixture);
+
+        // Planner has no data edges from the fork span — it should be reusable.
+        let orig_planner_fp = fixture.span_by_id("planner-001").output_fingerprint.clone();
+
+        let fake = FakeModelExecutor::new("fn test_auth() { assert!(true); }");
+        let registry =
+            CompositeExecutorRegistry::new().with_model_mode(ModelExecutorMode::Fake(fake));
+        let engine = ReplayEngine::new(storage.clone(), registry);
+
+        let request = make_branch_request(&fixture.run.run_id, "llm-001");
+        let execution = engine.execute_fork(request).unwrap();
+        let target_run_id = &execution.target_run.run_id;
+
+        // Planner should NOT be re-executed — fingerprint unchanged.
+        let planner = storage
+            .get_span(target_run_id, &SpanId("planner-001".into()))
+            .unwrap();
+        assert_eq!(
+            planner.output_fingerprint, orig_planner_fp,
+            "planner should retain original fingerprint"
+        );
+
+        // LLM should have been re-executed with new fingerprint.
+        let llm = storage
+            .get_span(target_run_id, &SpanId("llm-001".into()))
+            .unwrap();
+        assert_eq!(llm.status, SpanStatus::Completed);
+        assert!(llm.output_fingerprint.is_some());
+        assert_ne!(
+            llm.output_fingerprint,
+            fixture.span_by_id("llm-001").output_fingerprint,
+            "LLM should have a new fingerprint after rerun"
+        );
+
+        // Dirty set should include the fork span and downstream dependents.
+        let dirty_ids: Vec<_> = execution
+            .plan
+            .dirty_spans
+            .iter()
+            .map(|d| d.span_id.0.as_str())
+            .collect();
+        assert!(dirty_ids.contains(&"llm-001"), "fork span should be dirty");
+        // file-write-001 depends on llm-001 → downstream, should be dirty.
+        assert!(
+            dirty_ids.contains(&"file-write-001"),
+            "file-write (downstream of llm) should be dirty"
+        );
+        // shell-001 depends on file-write-001 → transitive downstream.
+        assert!(
+            dirty_ids.contains(&"shell-001"),
+            "shell (transitive downstream) should be dirty"
+        );
+        // file-read-001 is upstream of llm-001 (llm depends on it), NOT dirty.
+        assert!(
+            !dirty_ids.contains(&"file-read-001"),
+            "file-read (upstream) should NOT be dirty"
+        );
+        // Planner is NOT in the dependency graph of the fork span.
+        assert!(
+            !dirty_ids.contains(&"planner-001"),
+            "planner should NOT be dirty"
+        );
+    }
+
+    #[test]
+    fn missing_content_blocks_file_write_at_contract() {
+        use replaykit_core_model::{BranchRequest, PatchManifest, PatchType, Value};
+        use replaykit_replay_engine::ReplayEngine;
+        use replaykit_replay_engine::executors::CompositeExecutorRegistry;
+
+        let fixture = generate_missing_content_fixture();
+        let storage = load_fixture_into_storage(&fixture);
+
+        let registry = CompositeExecutorRegistry::new();
+        let engine = ReplayEngine::new(storage.clone(), registry);
+
+        let request = BranchRequest {
+            source_run_id: fixture.run.run_id.clone(),
+            fork_span_id: SpanId("file-write-001".into()),
+            patch_manifest: PatchManifest {
+                patch_type: PatchType::EnvVarOverride,
+                target_artifact_id: None,
+                replacement: Value::Text("patched output".into()),
+                note: Some("test missing content".into()),
+                created_at: 900,
+            },
+            created_by: Some("test".into()),
+        };
+
+        let execution = engine.execute_fork(request).unwrap();
+        let target_run_id = &execution.target_run.run_id;
+
+        // File write should be blocked due to missing content.
+        let fwrite = storage
+            .get_span(target_run_id, &SpanId("file-write-001".into()))
+            .unwrap();
+        assert_eq!(fwrite.status, SpanStatus::Blocked);
+        assert!(
+            fwrite
+                .error_summary
+                .as_ref()
+                .unwrap()
+                .to_lowercase()
+                .contains("content"),
+            "blocked reason should mention content: {:?}",
+            fwrite.error_summary
+        );
+
+        // Shell depends on file-write (downstream), so it is in the dirty set.
+        // Since file-write is blocked, shell is blocked too (upstream not completed).
+        let shell = storage
+            .get_span(target_run_id, &SpanId("shell-001".into()))
+            .unwrap();
+        assert_eq!(
+            shell.status,
+            SpanStatus::Blocked,
+            "shell should be blocked because upstream file-write is blocked"
+        );
+    }
+
+    #[test]
+    fn fake_model_rerun_is_deterministic() {
+        use replaykit_replay_engine::ReplayEngine;
+        use replaykit_replay_engine::executors::{
+            CompositeExecutorRegistry, FakeModelExecutor, ModelExecutorMode,
+        };
+
+        let fixture = generate_failed_coding_agent();
+
+        // Run the same fork twice with identical config.
+        let mut fingerprints = Vec::new();
+        for _ in 0..2 {
+            let storage = load_fixture_into_storage(&fixture);
+            let fake = FakeModelExecutor::new("deterministic response");
+            let registry =
+                CompositeExecutorRegistry::new().with_model_mode(ModelExecutorMode::Fake(fake));
+            let engine = ReplayEngine::new(storage.clone(), registry);
+
+            let request = make_branch_request(&fixture.run.run_id, "llm-001");
+            let execution = engine.execute_fork(request).unwrap();
+
+            let llm = storage
+                .get_span(&execution.target_run.run_id, &SpanId("llm-001".into()))
+                .unwrap();
+            fingerprints.push(llm.output_fingerprint.clone());
+        }
+
+        assert_eq!(
+            fingerprints[0], fingerprints[1],
+            "fake model should produce identical fingerprints across runs"
+        );
+    }
+
+    #[test]
+    fn branch_status_differs_from_source_for_right_reason() {
+        use replaykit_replay_engine::ReplayEngine;
+        use replaykit_replay_engine::executors::CompositeExecutorRegistry;
+
+        let fixture = generate_failed_coding_agent();
+        assert_eq!(
+            fixture.run.status,
+            RunStatus::Failed,
+            "source should be Failed"
+        );
+
+        let storage = load_fixture_into_storage(&fixture);
+
+        // Default model mode is Blocked — LLM rerun will be blocked.
+        let registry = CompositeExecutorRegistry::new();
+        let engine = ReplayEngine::new(storage.clone(), registry);
+
+        let request = make_branch_request(&fixture.run.run_id, "llm-001");
+        let execution = engine.execute_fork(request).unwrap();
+
+        // Target run should be Blocked (replay reason), not Failed (shell reason).
+        assert_eq!(
+            execution.target_run.status,
+            RunStatus::Blocked,
+            "branch should be Blocked (replay), not Failed (shell): got {:?}",
+            execution.target_run.status
+        );
+
+        // LLM span should be blocked with a model-specific reason.
+        let llm = storage
+            .get_span(&execution.target_run.run_id, &SpanId("llm-001".into()))
+            .unwrap();
+        assert_eq!(llm.status, SpanStatus::Blocked);
+        assert!(
+            llm.error_summary.as_ref().unwrap().contains("model"),
+            "blocked reason should mention model executor: {:?}",
+            llm.error_summary
+        );
+    }
+
+    #[test]
+    fn replay_outputs_persist_and_are_queryable() {
+        use replaykit_replay_engine::ReplayEngine;
+        use replaykit_replay_engine::executors::{
+            CompositeExecutorRegistry, FakeModelExecutor, ModelExecutorMode,
+        };
+
+        let fixture = generate_failed_coding_agent();
+        let storage = load_fixture_into_storage(&fixture);
+
+        let fake = FakeModelExecutor::new("fn test_auth() { assert!(true); }");
+        let registry =
+            CompositeExecutorRegistry::new().with_model_mode(ModelExecutorMode::Fake(fake));
+        let engine = ReplayEngine::new(storage.clone(), registry);
+
+        let request = make_branch_request(&fixture.run.run_id, "llm-001");
+        let execution = engine.execute_fork(request).unwrap();
+        let target_run_id = &execution.target_run.run_id;
+
+        // LLM span was re-executed — verify its output artifacts are queryable.
+        let llm = storage
+            .get_span(target_run_id, &SpanId("llm-001".into()))
+            .unwrap();
+        assert_eq!(llm.status, SpanStatus::Completed);
+        assert!(
+            !llm.output_artifact_ids.is_empty(),
+            "completed LLM span should have output artifacts"
+        );
+
+        for artifact_id in &llm.output_artifact_ids {
+            let artifact = storage.get_artifact(target_run_id, artifact_id).unwrap();
+            assert_eq!(artifact.artifact_id, *artifact_id);
+            assert!(artifact.byte_len > 0, "artifact should have content");
+
+            // Verify content is readable.
+            let content = storage.read_artifact_content(target_run_id, artifact_id);
+            assert!(
+                content.is_ok(),
+                "artifact content should be readable: {:?}",
+                content.err()
+            );
+        }
     }
 }
