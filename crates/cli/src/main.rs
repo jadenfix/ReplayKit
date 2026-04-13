@@ -80,8 +80,8 @@ fn run_command<S: Storage + 'static>(command: &str, storage: Arc<S>) {
     }
 }
 
-fn seed_demo_run<S: Storage>(storage: Arc<S>) -> Result<RunId, String> {
-    let session = SemanticSession::start(storage, "demo coding run", "agent.main")
+fn seed_demo_run<S: Storage + 'static>(storage: Arc<S>) -> Result<RunId, String> {
+    let session = SemanticSession::start(storage, "demo coding run", "agent.main", 1)
         .map_err(|err| err.to_string())?;
     let run_id = session.run().run_id.clone();
 

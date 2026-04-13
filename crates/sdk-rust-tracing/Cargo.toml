@@ -13,3 +13,8 @@ path = "src/lib.rs"
 replaykit-core-model = { path = "../core-model" }
 replaykit-collector = { path = "../collector" }
 replaykit-storage = { path = "../storage" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+
+[dev-dependencies]
+serde_json = "1"
