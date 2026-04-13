@@ -15,3 +15,7 @@ replaykit-core-model = { path = "../core-model" }
 replaykit-storage = { path = "../storage" }
 replaykit-sdk-rust-tracing = { path = "../sdk-rust-tracing" }
 replaykit-replay-engine = { path = "../replay-engine" }
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

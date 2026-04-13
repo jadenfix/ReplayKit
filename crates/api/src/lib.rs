@@ -1,48 +1,22 @@
+pub mod errors;
+pub mod server;
+pub mod views;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use replaykit_collector::{
-    ArtifactSpec, BeginRun, Collector, CollectorError, EdgeSpec, EndSpan, EventSpec, SnapshotSpec,
-    SpanSpec,
+    ArtifactSpec, BeginRun, Collector, EdgeSpec, EndSpan, EventSpec, SnapshotSpec, SpanSpec,
 };
 use replaykit_core_model::{
-    BranchPlan, BranchRequest, RunDiffRecord, RunId, RunRecord, RunTreeNode, SpanId, SpanRecord,
+    ArtifactRecord, BranchPlan, BranchRequest, ReplayJobId, ReplayJobRecord, RunDiffRecord, RunId,
+    RunRecord, RunTreeNode, SpanEdgeRecord, SpanId, SpanRecord,
 };
-use replaykit_diff_engine::{DiffEngine, DiffError};
-use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine, ReplayError};
-use replaykit_storage::{Storage, StorageError};
+use replaykit_diff_engine::DiffEngine;
+use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine};
+use replaykit_storage::Storage;
 
-#[derive(Debug)]
-pub enum ApiError {
-    Storage(StorageError),
-    Collector(CollectorError),
-    Replay(ReplayError),
-    Diff(DiffError),
-}
-
-impl From<StorageError> for ApiError {
-    fn from(value: StorageError) -> Self {
-        Self::Storage(value)
-    }
-}
-
-impl From<CollectorError> for ApiError {
-    fn from(value: CollectorError) -> Self {
-        Self::Collector(value)
-    }
-}
-
-impl From<ReplayError> for ApiError {
-    fn from(value: ReplayError) -> Self {
-        Self::Replay(value)
-    }
-}
-
-impl From<DiffError> for ApiError {
-    fn from(value: DiffError) -> Self {
-        Self::Diff(value)
-    }
-}
+pub use crate::errors::{ApiError, ApiErrorBody};
 
 pub struct ReplayKitService<S: Storage, E: ExecutorRegistry> {
     storage: Arc<S>,
@@ -61,9 +35,29 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Run management (collector pass-through)
+    // -----------------------------------------------------------------------
+
     pub fn begin_run(&self, request: BeginRun) -> Result<RunRecord, ApiError> {
         self.collector.begin_run(request).map_err(Into::into)
     }
+
+    pub fn finish_run(
+        &self,
+        run_id: &RunId,
+        ended_at: u64,
+        status: replaykit_core_model::RunStatus,
+        final_output_preview: Option<String>,
+    ) -> Result<RunRecord, ApiError> {
+        self.collector
+            .finish_run(run_id, ended_at, status, final_output_preview)
+            .map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Span management (collector pass-through)
+    // -----------------------------------------------------------------------
 
     pub fn start_span(
         &self,
@@ -75,6 +69,21 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
             .start_span(run_id, trace_id, spec)
             .map_err(Into::into)
     }
+
+    pub fn end_span(
+        &self,
+        run_id: &RunId,
+        span_id: &SpanId,
+        spec: EndSpan,
+    ) -> Result<SpanRecord, ApiError> {
+        self.collector
+            .end_span(run_id, span_id, spec)
+            .map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Data collection (collector pass-through)
+    // -----------------------------------------------------------------------
 
     pub fn add_event(
         &self,
@@ -114,31 +123,20 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         Ok(())
     }
 
-    pub fn end_span(
-        &self,
-        run_id: &RunId,
-        span_id: &SpanId,
-        spec: EndSpan,
-    ) -> Result<SpanRecord, ApiError> {
-        self.collector
-            .end_span(run_id, span_id, spec)
-            .map_err(Into::into)
-    }
-
-    pub fn finish_run(
-        &self,
-        run_id: &RunId,
-        ended_at: u64,
-        status: replaykit_core_model::RunStatus,
-        final_output_preview: Option<String>,
-    ) -> Result<RunRecord, ApiError> {
-        self.collector
-            .finish_run(run_id, ended_at, status, final_output_preview)
-            .map_err(Into::into)
-    }
+    // -----------------------------------------------------------------------
+    // Query endpoints
+    // -----------------------------------------------------------------------
 
     pub fn list_runs(&self) -> Result<Vec<RunRecord>, ApiError> {
         self.storage.list_runs().map_err(Into::into)
+    }
+
+    pub fn get_run(&self, run_id: &RunId) -> Result<RunRecord, ApiError> {
+        self.storage.get_run(run_id).map_err(Into::into)
+    }
+
+    pub fn get_span(&self, run_id: &RunId, span_id: &SpanId) -> Result<SpanRecord, ApiError> {
+        self.storage.get_span(run_id, span_id).map_err(Into::into)
     }
 
     pub fn run_tree(&self, run_id: &RunId) -> Result<Vec<RunTreeNode>, ApiError> {
@@ -150,11 +148,51 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
                 .or_default()
                 .push(span);
         }
-        for spans in by_parent.values_mut() {
-            spans.sort_by_key(|span| span.sequence_no);
+        for siblings in by_parent.values_mut() {
+            siblings.sort_by_key(|span| span.sequence_no);
         }
         Ok(build_tree(None, &by_parent))
     }
+
+    pub fn span_artifacts(
+        &self,
+        run_id: &RunId,
+        span_id: &SpanId,
+    ) -> Result<Vec<ArtifactRecord>, ApiError> {
+        let span = self.storage.get_span(run_id, span_id)?;
+        let all_artifacts = self.storage.list_artifacts(run_id)?;
+        let span_artifact_ids: std::collections::BTreeSet<_> = span
+            .input_artifact_ids
+            .iter()
+            .chain(span.output_artifact_ids.iter())
+            .collect();
+        Ok(all_artifacts
+            .into_iter()
+            .filter(|a| {
+                span_artifact_ids.contains(&a.artifact_id) || a.span_id.as_ref() == Some(span_id)
+            })
+            .collect())
+    }
+
+    pub fn span_dependencies(
+        &self,
+        run_id: &RunId,
+        span_id: &SpanId,
+    ) -> Result<Vec<SpanEdgeRecord>, ApiError> {
+        let edges = self.storage.list_edges(run_id)?;
+        Ok(edges
+            .into_iter()
+            .filter(|e| e.from_span_id == *span_id || e.to_span_id == *span_id)
+            .collect())
+    }
+
+    pub fn get_replay_job(&self, job_id: &ReplayJobId) -> Result<ReplayJobRecord, ApiError> {
+        self.storage.get_replay_job(job_id).map_err(Into::into)
+    }
+
+    // -----------------------------------------------------------------------
+    // Branch and replay
+    // -----------------------------------------------------------------------
 
     pub fn plan_branch(&self, request: &BranchRequest) -> Result<BranchPlan, ApiError> {
         self.replay.plan_fork(request).map_err(Into::into)
@@ -169,6 +207,10 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         )?;
         Ok(execution)
     }
+
+    // -----------------------------------------------------------------------
+    // Diff
+    // -----------------------------------------------------------------------
 
     pub fn diff_runs(
         &self,
@@ -220,7 +262,7 @@ mod tests {
         ReplayPolicy, RunStatus, SpanId, SpanKind, SpanStatus, Value,
     };
     use replaykit_replay_engine::{ExecutionResult, ProducedArtifact, ReplayExecutionContext};
-    use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage};
+    use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage, StorageError};
 
     use super::*;
 
@@ -355,6 +397,141 @@ mod tests {
         }
 
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn get_run_returns_not_found_for_missing_run() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let result = service.get_run(&RunId("nonexistent".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn span_artifacts_returns_attached_artifacts() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let artifacts = service
+            .span_artifacts(&run.run_id, &SpanId("tool".into()))
+            .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_type, ArtifactType::ToolOutput);
+    }
+
+    #[test]
+    fn span_dependencies_returns_edges_for_span() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let deps = service
+            .span_dependencies(&run.run_id, &SpanId("tool".into()))
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].to_span_id, SpanId("answer".into()));
+    }
+
+    #[test]
+    fn view_models_serialize_correctly() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+
+        let view = views::RunSummaryView::from_record(&run);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["status"], "Failed");
+        assert_eq!(json["status_label"], "failed");
+        assert_eq!(json["is_branch"], false);
+
+        let span = service
+            .get_span(&run.run_id, &SpanId("tool".into()))
+            .unwrap();
+        let span_view = views::SpanDetailView::from_record(&span);
+        let span_json = serde_json::to_value(&span_view).unwrap();
+        assert_eq!(span_json["kind"], "ToolCall");
+        assert_eq!(span_json["status_label"], "completed");
+    }
+
+    #[test]
+    fn error_body_serializes_with_correct_code() {
+        let err = ApiError::Storage(StorageError::NotFound("run not found".into()));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 404);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["code"], "not_found");
+        assert_eq!(json["message"], "run not found");
+    }
+
+    #[test]
+    fn error_replay_blocked_maps_to_422() {
+        let err = ApiError::Replay(replaykit_replay_engine::ReplayError::Blocked(
+            "no executor".into(),
+        ));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 422);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["code"], "replay_blocked");
+    }
+
+    #[test]
+    fn error_invalid_patch_maps_to_400() {
+        let err = ApiError::Replay(replaykit_replay_engine::ReplayError::InvalidPatch(
+            "bad patch".into(),
+        ));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 400);
+        assert_eq!(body.code, crate::errors::ErrorCode::InvalidPatch);
+    }
+
+    #[test]
+    fn error_storage_internal_maps_to_500() {
+        let err = ApiError::Storage(StorageError::Internal("db gone".into()));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 500);
+        assert_eq!(body.code, crate::errors::ErrorCode::Internal);
+    }
+
+    #[test]
+    fn run_summary_view_golden_json_shape() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let view = views::RunSummaryView::from_record(&run);
+        let json = serde_json::to_value(&view).unwrap();
+        // Verify all expected top-level keys are present
+        for key in &[
+            "run_id",
+            "title",
+            "status",
+            "status_label",
+            "started_at",
+            "ended_at",
+            "span_count",
+            "error_count",
+            "token_count",
+            "estimated_cost_micros",
+            "failure_class",
+            "is_branch",
+            "source_run_id",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "missing key '{key}' in RunSummaryView"
+            );
+        }
+    }
+
+    #[test]
+    fn span_detail_view_replay_policy_is_stable_label() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let span = service
+            .get_span(&run.run_id, &SpanId("tool".into()))
+            .unwrap();
+        let view = views::SpanDetailView::from_record(&span);
+        // Should be a stable snake_case label, not Rust Debug format
+        assert_eq!(view.replay_policy, "rerunnable_supported");
     }
 
     fn seed_run<S: Storage>(service: &ReplayKitService<S, FakeExecutorRegistry>) -> RunRecord {

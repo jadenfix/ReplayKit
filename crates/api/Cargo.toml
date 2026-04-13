@@ -15,3 +15,10 @@ replaykit-storage = { path = "../storage" }
 replaykit-collector = { path = "../collector" }
 replaykit-replay-engine = { path = "../replay-engine" }
 replaykit-diff-engine = { path = "../diff-engine" }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+axum-test = "17"
