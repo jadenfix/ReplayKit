@@ -128,6 +128,8 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
         .record_completed_span(
             shell_command("cargo test")
                 .command("cargo test --test auth")
+                .cwd("/workspace/project")
+                .timeout_ms(30_000)
                 .span_id("shell-test")
                 .parent(&planner.span_id)
                 .times(141, 160)
@@ -182,6 +184,9 @@ fn main() {
     }
 
     println!("\nThe shell span (shell-test) is RerunnableSupported and Failed.");
+    println!(
+        "All replayable spans carry explicit contract attributes (command, cwd, path, content, model)."
+    );
     println!("This is the natural branch point for a replay-and-fix workflow.");
 }
 
