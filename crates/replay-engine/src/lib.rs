@@ -60,6 +60,7 @@ pub struct ProducedArtifact {
     pub sha256: String,
     pub byte_len: usize,
     pub blob_path: String,
+    pub content: Option<Vec<u8>>,
     pub summary: Document,
     pub redaction: Document,
     pub created_at: u64,
@@ -282,6 +283,17 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
             target_run_id: target_run_id.clone(),
             fork_span_id: request.fork_span_id.clone(),
         };
+        let edge_map =
+            source_edges
+                .iter()
+                .fold(BTreeMap::<SpanId, Vec<SpanId>>::new(), |mut map, edge| {
+                    if edge.kind == EdgeKind::DataDependsOn {
+                        map.entry(edge.to_span_id.clone())
+                            .or_default()
+                            .push(edge.from_span_id.clone());
+                    }
+                    map
+                });
 
         for source_span in source_spans {
             if !dirty_map.contains_key(&source_span.span_id) {
@@ -304,6 +316,19 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
             if patch_disposition == PatchDisposition::SatisfiesSpan {
                 target_span.ended_at = Some(now);
                 target_span.status = SpanStatus::Completed;
+                self.storage.upsert_span(target_span)?;
+                continue;
+            }
+
+            if let Some(blocking_span_id) =
+                first_non_completed_upstream(&target_span, &dirty_map, &edge_map, &*self.storage)?
+            {
+                target_span.status = SpanStatus::Blocked;
+                target_span.ended_at = Some(now);
+                target_span.error_summary = Some(format!(
+                    "replay blocked: upstream span {} did not complete",
+                    blocking_span_id.0
+                ));
                 self.storage.upsert_span(target_span)?;
                 continue;
             }
@@ -498,7 +523,7 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
         let mut artifact_ids = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             let artifact_id = ArtifactId(self.storage.allocate_id(IdKind::Artifact)?);
-            self.storage.insert_artifact(ArtifactRecord {
+            let record = ArtifactRecord {
                 artifact_id: artifact_id.clone(),
                 run_id: run_id.clone(),
                 span_id: Some(span_id.clone()),
@@ -510,7 +535,12 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
                 summary: artifact.summary,
                 redaction: artifact.redaction,
                 created_at: artifact.created_at,
-            })?;
+            };
+            if let Some(content) = artifact.content {
+                self.storage.store_artifact_with_content(record, &content)?;
+            } else {
+                self.storage.insert_artifact(record)?;
+            }
             artifact_ids.push(artifact_id);
         }
         Ok(artifact_ids)
@@ -527,7 +557,7 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
         };
 
         let artifact_id = ArtifactId(self.storage.allocate_id(IdKind::Artifact)?);
-        self.storage.insert_artifact(ArtifactRecord {
+        let record = ArtifactRecord {
             artifact_id: artifact_id.clone(),
             run_id: run_id.clone(),
             span_id: Some(span_id.clone()),
@@ -539,7 +569,12 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
             summary: snapshot.artifact.summary,
             redaction: snapshot.artifact.redaction,
             created_at: snapshot.artifact.created_at,
-        })?;
+        };
+        if let Some(content) = snapshot.artifact.content {
+            self.storage.store_artifact_with_content(record, &content)?;
+        } else {
+            self.storage.insert_artifact(record)?;
+        }
 
         let snapshot_id = SnapshotId(self.storage.allocate_id(IdKind::Snapshot)?);
         self.storage.insert_snapshot(SnapshotRecord {
@@ -754,6 +789,33 @@ fn copy_run_data<S: Storage>(
     Ok(())
 }
 
+fn first_non_completed_upstream<S: Storage>(
+    span: &SpanRecord,
+    dirty_map: &BTreeMap<SpanId, DirtySpanRecord>,
+    edge_map: &BTreeMap<SpanId, Vec<SpanId>>,
+    storage: &S,
+) -> Result<Option<SpanId>, ReplayError> {
+    let mut upstream = Vec::new();
+    if let Some(parent_span_id) = &span.parent_span_id {
+        upstream.push(parent_span_id.clone());
+    }
+    if let Some(explicit) = edge_map.get(&span.span_id) {
+        upstream.extend(explicit.iter().cloned());
+    }
+
+    for upstream_span_id in upstream {
+        if !dirty_map.contains_key(&upstream_span_id) {
+            continue;
+        }
+        let upstream_span = storage.get_span(&span.run_id, &upstream_span_id)?;
+        if upstream_span.status != SpanStatus::Completed {
+            return Ok(Some(upstream_span_id));
+        }
+    }
+
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -763,9 +825,10 @@ mod tests {
         PatchManifest, PatchType, ReplayPolicy, RunRecord, RunStatus, SpanEdgeRecord, SpanKind,
         SpanRecord, SpanStatus, TraceId, Value,
     };
-    use replaykit_storage::InMemoryStorage;
+    use replaykit_storage::{InMemoryStorage, Storage};
 
     use super::*;
+    use crate::executors::CompositeExecutorRegistry;
 
     struct FakeExecutorRegistry;
 
@@ -786,6 +849,7 @@ mod tests {
                     sha256: format!("tool-output:{}", span.span_id.0),
                     byte_len: 1,
                     blob_path: format!("memory://tool/{}", span.span_id.0),
+                    content: None,
                     summary: summary_from_pairs(&[("tool", "patched tool output")]),
                     redaction: Document::new(),
                     created_at: 25,
@@ -796,6 +860,7 @@ mod tests {
                     sha256: format!("model-output:{}", span.span_id.0),
                     byte_len: 1,
                     blob_path: format!("memory://llm/{}", span.span_id.0),
+                    content: None,
                     summary: summary_from_pairs(&[("answer", "patched final answer")]),
                     redaction: Document::new(),
                     created_at: 26,
@@ -811,6 +876,7 @@ mod tests {
                     sha256: format!("snapshot:{}", span.span_id.0),
                     byte_len: 1,
                     blob_path: format!("memory://snapshot/{}", span.span_id.0),
+                    content: None,
                     summary: summary_from_pairs(&[("state", "post-replay")]),
                     redaction: Document::new(),
                     created_at: 27,
@@ -1127,6 +1193,224 @@ mod tests {
             .get_artifact(&execution.target_run.run_id, &snapshot.artifact_id)
             .unwrap();
         assert_eq!(snapshot_artifact.artifact_type, ArtifactType::StateSnapshot);
+    }
+
+    #[test]
+    fn shell_replay_persists_artifact_content() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let run = RunRecord::new(
+            RunId("run-shell".into()),
+            TraceId("trace-shell".into()),
+            "shell",
+            "agent.main",
+            "adapter",
+            "0.1.0",
+            1,
+        );
+        storage.insert_run(run.clone()).unwrap();
+        storage
+            .upsert_span(SpanRecord {
+                run_id: run.run_id.clone(),
+                span_id: SpanId("shell".into()),
+                trace_id: run.trace_id.clone(),
+                parent_span_id: None,
+                sequence_no: 1,
+                kind: SpanKind::ShellCommand,
+                name: "printf hello".into(),
+                status: SpanStatus::Completed,
+                started_at: 1,
+                ended_at: Some(2),
+                replay_policy: ReplayPolicy::RerunnableSupported,
+                executor_kind: Some("shell".into()),
+                executor_version: Some("sh".into()),
+                input_artifact_ids: Vec::new(),
+                output_artifact_ids: Vec::new(),
+                snapshot_id: None,
+                input_fingerprint: None,
+                output_fingerprint: Some("shell-out".into()),
+                environment_fingerprint: None,
+                attributes: Document::new(),
+                error_code: None,
+                error_summary: None,
+                cost: CostMetrics::default(),
+            })
+            .unwrap();
+
+        let engine = ReplayEngine::new(storage.clone(), CompositeExecutorRegistry::new());
+        let execution = engine
+            .execute_fork(BranchRequest {
+                source_run_id: run.run_id.clone(),
+                fork_span_id: SpanId("shell".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::EnvVarOverride,
+                    target_artifact_id: None,
+                    replacement: Value::Text("PATH=/usr/bin".into()),
+                    note: None,
+                    created_at: 10,
+                },
+                created_by: None,
+            })
+            .unwrap();
+
+        let shell = storage
+            .get_span(&execution.target_run.run_id, &SpanId("shell".into()))
+            .unwrap();
+        assert_eq!(shell.status, SpanStatus::Completed);
+        assert!(!shell.output_artifact_ids.is_empty());
+
+        let stdout_id = shell.output_artifact_ids[0].clone();
+        let content = storage
+            .read_artifact_content(&execution.target_run.run_id, &stdout_id)
+            .unwrap();
+        assert_eq!(String::from_utf8(content).unwrap(), "hello");
+    }
+
+    #[test]
+    fn blocked_upstream_prevents_downstream_execution() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let run = RunRecord::new(
+            RunId("run-upstream".into()),
+            TraceId("trace-upstream".into()),
+            "upstream",
+            "agent.main",
+            "adapter",
+            "0.1.0",
+            1,
+        );
+        storage.insert_run(run.clone()).unwrap();
+
+        let planner = SpanRecord {
+            run_id: run.run_id.clone(),
+            span_id: SpanId("planner".into()),
+            trace_id: run.trace_id.clone(),
+            parent_span_id: None,
+            sequence_no: 1,
+            kind: SpanKind::PlannerStep,
+            name: "planner".into(),
+            status: SpanStatus::Completed,
+            started_at: 1,
+            ended_at: Some(2),
+            replay_policy: ReplayPolicy::RecordOnly,
+            executor_kind: None,
+            executor_version: None,
+            input_artifact_ids: Vec::new(),
+            output_artifact_ids: Vec::new(),
+            snapshot_id: None,
+            input_fingerprint: None,
+            output_fingerprint: Some("planner".into()),
+            environment_fingerprint: None,
+            attributes: Document::new(),
+            error_code: None,
+            error_summary: None,
+            cost: CostMetrics::default(),
+        };
+        let llm = SpanRecord {
+            span_id: SpanId("llm".into()),
+            sequence_no: 2,
+            kind: SpanKind::LlmCall,
+            name: "generate fix".into(),
+            replay_policy: ReplayPolicy::RerunnableSupported,
+            output_fingerprint: Some("llm-out".into()),
+            parent_span_id: Some(SpanId("planner".into())),
+            ..planner.clone()
+        };
+        let file_write = SpanRecord {
+            span_id: SpanId("file-write".into()),
+            sequence_no: 3,
+            kind: SpanKind::FileWrite,
+            name: "apply patch".into(),
+            replay_policy: ReplayPolicy::RerunnableSupported,
+            output_fingerprint: Some("write-out".into()),
+            parent_span_id: Some(SpanId("planner".into())),
+            ..planner.clone()
+        };
+        let shell = SpanRecord {
+            span_id: SpanId("shell".into()),
+            sequence_no: 4,
+            kind: SpanKind::ShellCommand,
+            name: "printf should-not-run".into(),
+            replay_policy: ReplayPolicy::RerunnableSupported,
+            output_fingerprint: Some("shell-out".into()),
+            parent_span_id: Some(SpanId("planner".into())),
+            ..planner.clone()
+        };
+
+        storage.upsert_span(planner).unwrap();
+        storage.upsert_span(llm).unwrap();
+        storage.upsert_span(file_write).unwrap();
+        storage.upsert_span(shell).unwrap();
+        storage
+            .insert_edge(SpanEdgeRecord {
+                edge_id: EdgeId("edge-llm-file".into()),
+                run_id: run.run_id.clone(),
+                from_span_id: SpanId("llm".into()),
+                to_span_id: SpanId("file-write".into()),
+                kind: EdgeKind::DataDependsOn,
+                attributes: Document::new(),
+            })
+            .unwrap();
+        storage
+            .insert_edge(SpanEdgeRecord {
+                edge_id: EdgeId("edge-file-shell".into()),
+                run_id: run.run_id.clone(),
+                from_span_id: SpanId("file-write".into()),
+                to_span_id: SpanId("shell".into()),
+                kind: EdgeKind::DataDependsOn,
+                attributes: Document::new(),
+            })
+            .unwrap();
+
+        let engine = ReplayEngine::new(storage.clone(), CompositeExecutorRegistry::new());
+        let execution = engine
+            .execute_fork(BranchRequest {
+                source_run_id: run.run_id.clone(),
+                fork_span_id: SpanId("llm".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::PromptEdit,
+                    target_artifact_id: None,
+                    replacement: Value::Text("fix it".into()),
+                    note: None,
+                    created_at: 10,
+                },
+                created_by: None,
+            })
+            .unwrap();
+
+        assert_eq!(execution.target_run.status, RunStatus::Blocked);
+
+        let llm = storage
+            .get_span(&execution.target_run.run_id, &SpanId("llm".into()))
+            .unwrap();
+        let file_write = storage
+            .get_span(&execution.target_run.run_id, &SpanId("file-write".into()))
+            .unwrap();
+        let shell = storage
+            .get_span(&execution.target_run.run_id, &SpanId("shell".into()))
+            .unwrap();
+
+        assert_eq!(llm.status, SpanStatus::Blocked);
+        assert_eq!(
+            llm.error_summary.as_deref(),
+            Some("replay blocked: no executor registered")
+        );
+        assert_eq!(file_write.status, SpanStatus::Blocked);
+        assert!(
+            file_write
+                .error_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("upstream span llm did not complete")
+        );
+        assert!(file_write.output_artifact_ids.is_empty());
+        assert_eq!(shell.status, SpanStatus::Blocked);
+        assert!(
+            shell
+                .error_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("upstream span file-write did not complete")
+        );
+        assert!(shell.output_artifact_ids.is_empty());
     }
 
     fn summary_from_pairs(pairs: &[(&str, &str)]) -> Document {

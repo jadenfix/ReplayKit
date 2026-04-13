@@ -205,7 +205,9 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         run_id: &RunId,
         artifact_id: &ArtifactId,
     ) -> Result<ArtifactRecord, ApiError> {
-        self.storage.get_artifact(run_id, artifact_id).map_err(Into::into)
+        self.storage
+            .get_artifact(run_id, artifact_id)
+            .map_err(Into::into)
     }
 
     pub fn read_artifact_content(
@@ -318,6 +320,7 @@ mod tests {
                     sha256: "patched-answer".into(),
                     byte_len: 1,
                     blob_path: "memory://patched-answer".into(),
+                    content: None,
                     summary: summary_from_pairs(&[("answer", "patched answer")]),
                     redaction: Document::new(),
                     created_at: 10,

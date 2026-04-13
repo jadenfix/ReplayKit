@@ -18,7 +18,9 @@ use replaykit_core_model::{
 };
 use replaykit_storage::blob::sha256_hex;
 
-use crate::{ExecutionResult, ExecutorRegistry, ProducedArtifact, ReplayError, ReplayExecutionContext};
+use crate::{
+    ExecutionResult, ExecutorRegistry, ProducedArtifact, ReplayError, ReplayExecutionContext,
+};
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -83,6 +85,7 @@ impl ShellExecutor {
                 sha256: stdout_hash.clone(),
                 byte_len: output.stdout.len(),
                 blob_path: String::new(), // filled by persist_executor_artifacts
+                content: Some(output.stdout.clone()),
                 summary: summary(&[
                     ("exit_code", &exit_code.to_string()),
                     ("stdout_preview", &truncate_str(&stdout, 200)),
@@ -99,6 +102,7 @@ impl ShellExecutor {
                 sha256: stderr_hash.clone(),
                 byte_len: output.stderr.len(),
                 blob_path: String::new(),
+                content: Some(output.stderr.clone()),
                 summary: summary(&[
                     ("exit_code", &exit_code.to_string()),
                     ("stderr_preview", &truncate_str(&stderr, 200)),
@@ -118,6 +122,7 @@ impl ShellExecutor {
                 sha256: hash,
                 byte_len: content.len(),
                 blob_path: String::new(),
+                content: Some(content.into_bytes()),
                 summary: summary(&[("exit_code", &exit_code.to_string())]),
                 redaction: Document::new(),
                 created_at: now,
@@ -126,9 +131,8 @@ impl ShellExecutor {
 
         // Fingerprint includes content hashes, not lengths, so output changes
         // are always detectable even when sizes happen to match.
-        let fingerprint_input = format!(
-            "exit={exit_code};stdout={stdout_hash};stderr={stderr_hash}"
-        );
+        let fingerprint_input =
+            format!("exit={exit_code};stdout={stdout_hash};stderr={stderr_hash}");
         let output_fingerprint = sha256_hex(fingerprint_input.as_bytes());
 
         let (status, error_summary) = if exit_code == 0 {
@@ -175,18 +179,20 @@ impl FileReadExecutor {
             .map_err(|e| ReplayError::Blocked(format!("failed to read file {path}: {e}")))?;
 
         let hash = sha256_hex(&content);
+        let byte_len = content.len();
         let line_count = content.iter().filter(|&&b| b == b'\n').count();
 
         let artifact = ProducedArtifact {
             artifact_type: ArtifactType::FileBlob,
             mime: "application/octet-stream".into(),
             sha256: hash.clone(),
-            byte_len: content.len(),
+            byte_len,
             blob_path: String::new(),
+            content: Some(content),
             summary: summary(&[
                 ("path", &path),
                 ("lines", &line_count.to_string()),
-                ("bytes", &content.len().to_string()),
+                ("bytes", &byte_len.to_string()),
             ]),
             redaction: Document::new(),
             created_at: now,
@@ -222,19 +228,20 @@ impl FileWriteExecutor {
         let path = extract_file_path(span);
         let now = now_epoch_secs();
 
-        let content = extract_write_content(span).unwrap_or_default();
-        let hash = sha256_hex(content.as_bytes());
+        let content = extract_write_content(span).ok_or_else(|| {
+            ReplayError::Blocked("file write span is missing content attribute".into())
+        })?;
+        let diff = format!("--- {path}\n+++ {path}\n@@\n+{content}\n");
+        let hash = sha256_hex(diff.as_bytes());
 
         let artifact = ProducedArtifact {
             artifact_type: ArtifactType::FileDiff,
             mime: "text/plain".into(),
             sha256: hash.clone(),
-            byte_len: content.len(),
+            byte_len: diff.len(),
             blob_path: String::new(),
-            summary: summary(&[
-                ("path", &path),
-                ("bytes", &content.len().to_string()),
-            ]),
+            content: Some(diff.into_bytes()),
+            summary: summary(&[("path", &path), ("bytes", &content.len().to_string())]),
             redaction: Document::new(),
             created_at: now,
         };
@@ -320,7 +327,10 @@ fn extract_file_path(span: &SpanRecord) -> String {
         return path.clone();
     }
     let name = &span.name;
-    if let Some(rest) = name.strip_prefix("read ").or_else(|| name.strip_prefix("write ")) {
+    if let Some(rest) = name
+        .strip_prefix("read ")
+        .or_else(|| name.strip_prefix("write "))
+    {
         return rest.to_string();
     }
     name.clone()
@@ -437,10 +447,16 @@ mod tests {
     fn shell_fingerprint_changes_with_output_content() {
         let executor = ShellExecutor;
         let r1 = executor
-            .execute_span(&make_span(SpanKind::ShellCommand, "echo aaa"), &test_context())
+            .execute_span(
+                &make_span(SpanKind::ShellCommand, "echo aaa"),
+                &test_context(),
+            )
             .unwrap();
         let r2 = executor
-            .execute_span(&make_span(SpanKind::ShellCommand, "echo bbb"), &test_context())
+            .execute_span(
+                &make_span(SpanKind::ShellCommand, "echo bbb"),
+                &test_context(),
+            )
             .unwrap();
         // "aaa\n" and "bbb\n" have the same length (4 bytes) but different content.
         // Fingerprints must differ.
@@ -462,7 +478,10 @@ mod tests {
         let result = executor.execute_span(&span, &test_context()).unwrap();
         assert_eq!(result.status, SpanStatus::Completed);
         assert_eq!(result.output_artifacts.len(), 1);
-        assert_eq!(result.output_artifacts[0].artifact_type, ArtifactType::FileBlob);
+        assert_eq!(
+            result.output_artifacts[0].artifact_type,
+            ArtifactType::FileBlob
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -478,14 +497,27 @@ mod tests {
 
     #[test]
     fn file_write_executor_produces_diff_artifact_without_side_effect() {
-        let span = make_span(SpanKind::FileWrite, "output.txt");
+        let mut span = make_span(SpanKind::FileWrite, "output.txt");
+        span.attributes
+            .insert("content".into(), Value::Text("patched line".into()));
         let result = FileWriteExecutor
             .execute_span(&span, &test_context())
             .unwrap();
         assert_eq!(result.status, SpanStatus::Completed);
         assert_eq!(result.output_artifacts.len(), 1);
-        assert_eq!(result.output_artifacts[0].artifact_type, ArtifactType::FileDiff);
+        assert_eq!(
+            result.output_artifacts[0].artifact_type,
+            ArtifactType::FileDiff
+        );
+        assert!(result.output_artifacts[0].content.is_some());
         // No file should have been created on disk.
+    }
+
+    #[test]
+    fn file_write_executor_blocks_without_content() {
+        let span = make_span(SpanKind::FileWrite, "output.txt");
+        let result = FileWriteExecutor.execute_span(&span, &test_context());
+        assert!(matches!(result, Err(ReplayError::Blocked(_))));
     }
 
     // -- CompositeExecutorRegistry --------------------------------------------
