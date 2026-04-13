@@ -18,9 +18,6 @@ pub enum ErrorCode {
     Conflict,
     ReplayBlocked,
     InvalidPatch,
-    IntegrityError,
-    IncompatibleExecutor,
-    StorageUnavailable,
     Internal,
 }
 
@@ -87,8 +84,8 @@ impl ApiErrorBody {
             ErrorCode::NotFound => 404,
             ErrorCode::InvalidInput | ErrorCode::InvalidPatch => 400,
             ErrorCode::Conflict => 409,
-            ErrorCode::ReplayBlocked | ErrorCode::IncompatibleExecutor => 422,
-            ErrorCode::IntegrityError | ErrorCode::StorageUnavailable | ErrorCode::Internal => 500,
+            ErrorCode::ReplayBlocked => 422,
+            ErrorCode::Internal => 500,
         }
     }
 }
@@ -111,10 +108,12 @@ impl fmt::Display for ApiError {
             ApiError::Storage(e) => write!(f, "{e}"),
             ApiError::Collector(e) => write!(f, "{e}"),
             ApiError::Replay(e) => write!(f, "{e}"),
-            ApiError::Diff(e) => write!(f, "{e:?}"),
+            ApiError::Diff(DiffError::Storage(e)) => write!(f, "{e}"),
         }
     }
 }
+
+impl std::error::Error for ApiError {}
 
 impl From<StorageError> for ApiError {
     fn from(value: StorageError) -> Self {
@@ -150,11 +149,7 @@ impl From<ApiError> for ApiErrorBody {
                 details: None,
             },
             ApiError::Storage(StorageError::InvalidInput(msg)) => ApiErrorBody::invalid_input(msg),
-            ApiError::Storage(StorageError::Internal(msg)) => ApiErrorBody {
-                code: ErrorCode::StorageUnavailable,
-                message: msg,
-                details: None,
-            },
+            ApiError::Storage(StorageError::Internal(msg)) => ApiErrorBody::internal(msg),
             ApiError::Collector(CollectorError::Storage(se)) => {
                 ApiErrorBody::from(ApiError::Storage(se))
             }

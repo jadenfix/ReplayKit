@@ -1,7 +1,8 @@
 use replaykit_core_model::{
-    ArtifactRecord, ArtifactType, BranchPlan, BranchRecord, CostMetrics, DirtySpanRecord, Document,
-    EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus, ReplayMode, RunDiffRecord, RunRecord,
-    RunStatus, RunTreeNode, SpanEdgeRecord, SpanKind, SpanRecord, SpanStatus,
+    ArtifactRecord, ArtifactType, BranchPlan, BranchRecord, CostMetrics, DirtyReason,
+    DirtySpanRecord, Document, EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus,
+    ReplayMode, ReplayPolicy, RunDiffRecord, RunRecord, RunStatus, RunTreeNode, SpanEdgeRecord,
+    SpanKind, SpanRecord, SpanStatus,
 };
 use serde::Serialize;
 
@@ -60,6 +61,17 @@ pub struct RunTreeView {
     pub nodes: Vec<TreeNodeView>,
 }
 
+impl RunTreeView {
+    pub fn from_parts(run: &RunRecord, nodes: &[RunTreeNode]) -> Self {
+        Self {
+            run_id: run.run_id.0.clone(),
+            title: run.title.clone(),
+            status: run.status,
+            nodes: nodes.iter().map(TreeNodeView::from_tree_node).collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TreeNodeView {
     pub span_id: String,
@@ -111,7 +123,7 @@ pub struct SpanDetailView {
     pub status_label: &'static str,
     pub started_at: u64,
     pub ended_at: Option<u64>,
-    pub replay_policy: String,
+    pub replay_policy: &'static str,
     pub executor_kind: Option<String>,
     pub executor_version: Option<String>,
     pub input_fingerprint: Option<String>,
@@ -136,7 +148,7 @@ impl SpanDetailView {
             status_label: span_status_label(s.status),
             started_at: s.started_at,
             ended_at: s.ended_at,
-            replay_policy: format!("{:?}", s.replay_policy),
+            replay_policy: replay_policy_label(s.replay_policy),
             executor_kind: s.executor_kind.clone(),
             executor_version: s.executor_version.clone(),
             input_fingerprint: s.input_fingerprint.clone(),
@@ -341,7 +353,7 @@ impl BranchPlanView {
 #[derive(Clone, Debug, Serialize)]
 pub struct DirtySpanView {
     pub span_id: String,
-    pub reasons: Vec<String>,
+    pub reasons: Vec<&'static str>,
     pub triggered_by: Vec<String>,
 }
 
@@ -349,14 +361,14 @@ impl DirtySpanView {
     pub fn from_record(d: &DirtySpanRecord) -> Self {
         Self {
             span_id: d.span_id.0.clone(),
-            reasons: d.reasons.iter().map(|r| format!("{r:?}")).collect(),
+            reasons: d.reasons.iter().map(|r| dirty_reason_label(*r)).collect(),
             triggered_by: d.triggered_by.iter().map(|id| id.0.clone()).collect(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Label helpers
+// Label helpers (stable API strings, not Rust Debug format)
 // ---------------------------------------------------------------------------
 
 pub fn run_status_label(s: RunStatus) -> &'static str {
@@ -391,5 +403,26 @@ fn replay_job_status_label(s: ReplayJobStatus) -> &'static str {
         ReplayJobStatus::Failed => "failed",
         ReplayJobStatus::Completed => "completed",
         ReplayJobStatus::Canceled => "canceled",
+    }
+}
+
+pub fn replay_policy_label(p: ReplayPolicy) -> &'static str {
+    match p {
+        ReplayPolicy::RecordOnly => "record_only",
+        ReplayPolicy::RerunnableSupported => "rerunnable_supported",
+        ReplayPolicy::CacheableIfFingerprintMatches => "cacheable_if_fingerprint_matches",
+        ReplayPolicy::PureReusable => "pure_reusable",
+    }
+}
+
+pub fn dirty_reason_label(r: DirtyReason) -> &'static str {
+    match r {
+        DirtyReason::PatchedInput => "patched_input",
+        DirtyReason::FingerprintChanged => "fingerprint_changed",
+        DirtyReason::UpstreamOutputChanged => "upstream_output_changed",
+        DirtyReason::ExecutorVersionChanged => "executor_version_changed",
+        DirtyReason::PolicyForcedRerun => "policy_forced_rerun",
+        DirtyReason::MissingReusableArtifact => "missing_reusable_artifact",
+        DirtyReason::DependencyUnknown => "dependency_unknown",
     }
 }

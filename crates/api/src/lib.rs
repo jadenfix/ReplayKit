@@ -462,6 +462,78 @@ mod tests {
         assert_eq!(json["message"], "run not found");
     }
 
+    #[test]
+    fn error_replay_blocked_maps_to_422() {
+        let err = ApiError::Replay(replaykit_replay_engine::ReplayError::Blocked(
+            "no executor".into(),
+        ));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 422);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["code"], "replay_blocked");
+    }
+
+    #[test]
+    fn error_invalid_patch_maps_to_400() {
+        let err = ApiError::Replay(replaykit_replay_engine::ReplayError::InvalidPatch(
+            "bad patch".into(),
+        ));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 400);
+        assert_eq!(body.code, crate::errors::ErrorCode::InvalidPatch);
+    }
+
+    #[test]
+    fn error_storage_internal_maps_to_500() {
+        let err = ApiError::Storage(StorageError::Internal("db gone".into()));
+        let body: ApiErrorBody = err.into();
+        assert_eq!(body.http_status(), 500);
+        assert_eq!(body.code, crate::errors::ErrorCode::Internal);
+    }
+
+    #[test]
+    fn run_summary_view_golden_json_shape() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let view = views::RunSummaryView::from_record(&run);
+        let json = serde_json::to_value(&view).unwrap();
+        // Verify all expected top-level keys are present
+        for key in &[
+            "run_id",
+            "title",
+            "status",
+            "status_label",
+            "started_at",
+            "ended_at",
+            "span_count",
+            "error_count",
+            "token_count",
+            "estimated_cost_micros",
+            "failure_class",
+            "is_branch",
+            "source_run_id",
+        ] {
+            assert!(
+                json.get(key).is_some(),
+                "missing key '{key}' in RunSummaryView"
+            );
+        }
+    }
+
+    #[test]
+    fn span_detail_view_replay_policy_is_stable_label() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let service = ReplayKitService::new(storage, FakeExecutorRegistry);
+        let run = seed_run(&service);
+        let span = service
+            .get_span(&run.run_id, &SpanId("tool".into()))
+            .unwrap();
+        let view = views::SpanDetailView::from_record(&span);
+        // Should be a stable snake_case label, not Rust Debug format
+        assert_eq!(view.replay_policy, "rerunnable_supported");
+    }
+
     fn seed_run<S: Storage>(service: &ReplayKitService<S, FakeExecutorRegistry>) -> RunRecord {
         let run = service.begin_run(sample_begin_run("demo")).unwrap();
 

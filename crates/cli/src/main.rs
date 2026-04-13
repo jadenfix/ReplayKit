@@ -1,11 +1,14 @@
+use std::process;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use replaykit_api::ReplayKitService;
+use replaykit_api::errors::ApiErrorBody;
+use replaykit_api::server::{now_epoch_secs, parse_patch_type};
 use replaykit_api::views::{
-    self, ArtifactPreviewView, DependencyView, RunDiffSummaryView, RunSummaryView, SpanDetailView,
-    TreeNodeView,
+    self, ArtifactPreviewView, DependencyView, RunDiffSummaryView, RunSummaryView, RunTreeView,
+    SpanDetailView,
 };
+use replaykit_api::{ApiError, ReplayKitService};
 use replaykit_core_model::{
     BranchRequest, PatchManifest, PatchType, RunId, RunTreeNode, SpanId, SpanKind, Value,
 };
@@ -144,6 +147,25 @@ enum ReplayAction {
 }
 
 // ---------------------------------------------------------------------------
+// Error handling helper
+// ---------------------------------------------------------------------------
+
+fn die(err: ApiError) -> ! {
+    let body: ApiErrorBody = err.into();
+    eprintln!(
+        "error: [{}] {}",
+        serde_json::to_string(&body.code).unwrap_or_default(),
+        body.message
+    );
+    process::exit(1);
+}
+
+fn die_msg(msg: &str) -> ! {
+    eprintln!("error: {msg}");
+    process::exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -153,12 +175,18 @@ fn main() {
     match cli.storage.as_str() {
         "memory" => dispatch(cli, Arc::new(InMemoryStorage::new())),
         "sqlite" => {
-            let storage = SqliteStorage::open(&cli.db_path).expect("open sqlite storage");
+            let storage = match SqliteStorage::open(&cli.db_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: failed to open sqlite at {}: {e}", cli.db_path);
+                    process::exit(2);
+                }
+            };
             dispatch(cli, Arc::new(storage));
         }
         other => {
-            eprintln!("unsupported storage backend: {other}");
-            std::process::exit(2);
+            eprintln!("error: unsupported storage backend: {other}");
+            process::exit(2);
         }
     }
 }
@@ -220,7 +248,7 @@ fn cmd_runs_list<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
     service: &ReplayKitService<S, E>,
     json: bool,
 ) {
-    let runs = service.list_runs().expect("list runs");
+    let runs = service.list_runs().unwrap_or_else(|e| die(e));
     if json {
         let views: Vec<RunSummaryView> = runs.iter().map(RunSummaryView::from_record).collect();
         println!("{}", serde_json::to_string_pretty(&views).unwrap());
@@ -253,13 +281,14 @@ fn cmd_runs_show<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
     run_id: &str,
     json: bool,
 ) {
-    let run = service.get_run(&RunId(run_id.into())).expect("get run");
+    let run = service
+        .get_run(&RunId(run_id.into()))
+        .unwrap_or_else(|e| die(e));
+    let view = RunSummaryView::from_record(&run);
     if json {
-        let view = RunSummaryView::from_record(&run);
         println!("{}", serde_json::to_string_pretty(&view).unwrap());
         return;
     }
-    let view = RunSummaryView::from_record(&run);
     println!("Run:    {}", view.run_id);
     println!("Title:  {}", view.title);
     println!("Status: {}", status_badge(view.status_label));
@@ -286,16 +315,11 @@ fn cmd_runs_tree<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
     json: bool,
 ) {
     let rid = RunId(run_id.into());
-    let run = service.get_run(&rid).expect("get run");
-    let tree = service.run_tree(&rid).expect("run tree");
+    let run = service.get_run(&rid).unwrap_or_else(|e| die(e));
+    let tree = service.run_tree(&rid).unwrap_or_else(|e| die(e));
 
     if json {
-        let view = views::RunTreeView {
-            run_id: run.run_id.0.clone(),
-            title: run.title.clone(),
-            status: run.status,
-            nodes: tree.iter().map(TreeNodeView::from_tree_node).collect(),
-        };
+        let view = RunTreeView::from_parts(&run, &tree);
         println!("{}", serde_json::to_string_pretty(&view).unwrap());
         return;
     }
@@ -318,15 +342,14 @@ fn cmd_runs_diff<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
 ) {
     let diff = service
         .cached_diff(&RunId(source.into()), &RunId(target.into()))
-        .expect("get diff");
+        .unwrap_or_else(|e| die(e));
+    let view = RunDiffSummaryView::from_record(&diff);
 
     if json {
-        let view = RunDiffSummaryView::from_record(&diff);
         println!("{}", serde_json::to_string_pretty(&view).unwrap());
         return;
     }
 
-    let view = RunDiffSummaryView::from_record(&diff);
     println!("Diff: {} -> {}", view.source_run_id, view.target_run_id);
     println!(
         "Source status: {}  Target status: {}",
@@ -348,15 +371,14 @@ fn cmd_span_detail<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
 ) {
     let span = service
         .get_span(&RunId(run_id.into()), &SpanId(span_id.into()))
-        .expect("get span");
+        .unwrap_or_else(|e| die(e));
+    let view = SpanDetailView::from_record(&span);
 
     if json {
-        let view = SpanDetailView::from_record(&span);
         println!("{}", serde_json::to_string_pretty(&view).unwrap());
         return;
     }
 
-    let view = SpanDetailView::from_record(&span);
     println!("Span:     {}", view.span_id);
     println!("Name:     {}", view.name);
     println!("Kind:     {:?}", view.kind);
@@ -389,7 +411,7 @@ fn cmd_span_artifacts<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
 ) {
     let artifacts = service
         .span_artifacts(&RunId(run_id.into()), &SpanId(span_id.into()))
-        .expect("get artifacts");
+        .unwrap_or_else(|e| die(e));
 
     if json {
         let views: Vec<ArtifactPreviewView> = artifacts
@@ -421,7 +443,7 @@ fn cmd_span_deps<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
 ) {
     let edges = service
         .span_dependencies(&RunId(run_id.into()), &SpanId(span_id.into()))
-        .expect("get deps");
+        .unwrap_or_else(|e| die(e));
 
     if json {
         let views: Vec<DependencyView> = edges.iter().map(DependencyView::from_record).collect();
@@ -453,17 +475,18 @@ fn cmd_replay_fork<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
 ) {
     let replacement_text = if let Some(path) = patch_path {
         std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!("failed to read patch file {path}: {e}");
-            std::process::exit(1);
+            die_msg(&format!("failed to read patch file {path}: {e}"));
         })
     } else if let Some(text) = replacement_inline {
         text
     } else {
-        eprintln!("provide --patch <file> or --replacement <text>");
-        std::process::exit(1);
+        die_msg("provide --patch <file> or --replacement <text>");
     };
 
-    let patch_type = parse_patch_type(patch_type_str);
+    let patch_type = match parse_patch_type(patch_type_str) {
+        Ok(pt) => pt,
+        Err(e) => die_msg(&e.message),
+    };
 
     let request = BranchRequest {
         source_run_id: RunId(run_id.into()),
@@ -478,7 +501,7 @@ fn cmd_replay_fork<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
         created_by: Some("cli".into()),
     };
 
-    let execution = service.create_branch(request).expect("create branch");
+    let execution = service.create_branch(request).unwrap_or_else(|e| die(e));
 
     if json {
         let view = views::BranchExecutionView::from_parts(
@@ -503,7 +526,11 @@ fn cmd_replay_fork<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
     println!("  Reusable spans: {}", execution.plan.reusable_spans.len());
 
     for dirty in &execution.plan.dirty_spans {
-        let reasons: Vec<String> = dirty.reasons.iter().map(|r| format!("{r:?}")).collect();
+        let reasons: Vec<&str> = dirty
+            .reasons
+            .iter()
+            .map(|r| views::dirty_reason_label(*r))
+            .collect();
         println!("    {} [{}]", dirty.span_id.0, reasons.join(", "));
     }
 }
@@ -516,7 +543,10 @@ fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
     replacement: &str,
     json: bool,
 ) {
-    let patch_type = parse_patch_type(patch_type_str);
+    let patch_type = match parse_patch_type(patch_type_str) {
+        Ok(pt) => pt,
+        Err(e) => die_msg(&e.message),
+    };
 
     let request = BranchRequest {
         source_run_id: RunId(run_id.into()),
@@ -531,7 +561,7 @@ fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
         created_by: Some("cli".into()),
     };
 
-    let plan = service.plan_branch(&request).expect("plan branch");
+    let plan = service.plan_branch(&request).unwrap_or_else(|e| die(e));
 
     if json {
         let view = views::BranchPlanView::from_plan(&plan);
@@ -547,7 +577,11 @@ fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
     println!("  Blocked spans:  {}", plan.blocked_spans.len());
     println!("  Reusable spans: {}", plan.reusable_spans.len());
     for dirty in &plan.dirty_spans {
-        let reasons: Vec<String> = dirty.reasons.iter().map(|r| format!("{r:?}")).collect();
+        let reasons: Vec<&str> = dirty
+            .reasons
+            .iter()
+            .map(|r| views::dirty_reason_label(*r))
+            .collect();
         println!("    {} [{}]", dirty.span_id.0, reasons.join(", "));
     }
 }
@@ -556,13 +590,23 @@ fn cmd_serve<S: Storage + 'static, E: replaykit_replay_engine::ExecutorRegistry 
     service: Arc<ReplayKitService<S, E>>,
     port: u16,
 ) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        die_msg(&format!("failed to start tokio runtime: {e}"));
+    });
     rt.block_on(async {
         let router = replaykit_api::server::build_router(service);
         let addr = format!("127.0.0.1:{port}");
         println!("ReplayKit API server listening on http://{addr}");
-        let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-        axum::serve(listener, router).await.expect("serve");
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("error: failed to bind {addr}: {e}");
+                process::exit(2);
+            });
+        if let Err(e) = axum::serve(listener, router).await {
+            eprintln!("error: server failed: {e}");
+            process::exit(1);
+        }
     });
 }
 
@@ -571,7 +615,7 @@ fn cmd_demo<S: Storage + 'static, E: replaykit_replay_engine::ExecutorRegistry>(
     service: &ReplayKitService<S, E>,
     json: bool,
 ) {
-    let run_id = seed_demo_run(storage).expect("seed demo run");
+    let run_id = seed_demo_run(storage).unwrap_or_else(|e| die_msg(&e));
     if json {
         cmd_runs_show(service, &run_id.0, true);
     } else {
@@ -584,7 +628,7 @@ fn cmd_demo_branch<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
     service: &ReplayKitService<S, E>,
     json: bool,
 ) {
-    let run_id = seed_demo_run(storage).expect("seed demo run");
+    let run_id = seed_demo_run(storage).unwrap_or_else(|e| die_msg(&e));
     let execution = service
         .create_branch(BranchRequest {
             source_run_id: run_id.clone(),
@@ -598,7 +642,7 @@ fn cmd_demo_branch<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
             },
             created_by: Some("cli".into()),
         })
-        .expect("branch creation");
+        .unwrap_or_else(|e| die(e));
 
     if json {
         let view = views::BranchExecutionView::from_parts(
@@ -619,7 +663,11 @@ fn cmd_demo_branch<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
     );
     println!("Dirty spans:");
     for dirty in &execution.plan.dirty_spans {
-        let reasons: Vec<String> = dirty.reasons.iter().map(|r| format!("{r:?}")).collect();
+        let reasons: Vec<&str> = dirty
+            .reasons
+            .iter()
+            .map(|r| views::dirty_reason_label(*r))
+            .collect();
         println!("  {} [{}]", dirty.span_id.0, reasons.join(", "));
     }
     let diff = service
@@ -627,7 +675,7 @@ fn cmd_demo_branch<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
             &execution.branch.source_run_id,
             &execution.branch.target_run_id,
         )
-        .expect("cached diff");
+        .unwrap_or_else(|e| die(e));
     println!(
         "Diff: changed_spans={} first_divergent={}",
         diff.changed_span_count,
@@ -701,33 +749,13 @@ fn status_badge(label: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let end = max.saturating_sub(3);
+        let truncated: String = s.chars().take(end).collect();
+        format!("{truncated}...")
     }
-}
-
-fn parse_patch_type(s: &str) -> PatchType {
-    match s {
-        "prompt_edit" => PatchType::PromptEdit,
-        "tool_output_override" => PatchType::ToolOutputOverride,
-        "env_var_override" => PatchType::EnvVarOverride,
-        "model_config_edit" => PatchType::ModelConfigEdit,
-        "retrieval_context_override" => PatchType::RetrievalContextOverride,
-        "snapshot_override" => PatchType::SnapshotOverride,
-        other => {
-            eprintln!("unknown patch type: {other}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn seed_demo_run<S: Storage>(storage: Arc<S>) -> Result<RunId, String> {
@@ -792,4 +820,47 @@ fn seed_demo_run<S: Storage>(storage: Arc<S>) -> Result<RunId, String> {
         .map_err(|err| err.to_string())?;
 
     Ok(run_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_multibyte_does_not_panic() {
+        let s = "héllo wörld café";
+        let result = truncate(s, 8);
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 8);
+    }
+
+    #[test]
+    fn status_badge_contains_label() {
+        let badge = status_badge("completed");
+        assert!(badge.contains("completed"));
+        let badge = status_badge("unknown");
+        assert_eq!(badge, "unknown");
+    }
+
+    #[test]
+    fn parse_patch_type_roundtrip() {
+        assert!(parse_patch_type("tool_output_override").is_ok());
+        assert!(parse_patch_type("nonsense").is_err());
+    }
+
+    #[test]
+    fn demo_run_seeds_and_has_expected_structure() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let run_id = seed_demo_run(storage.clone()).unwrap();
+        let service = ReplayKitService::new(storage, NoopExecutorRegistry);
+        let tree = service.run_tree(&run_id).unwrap();
+        assert_eq!(tree.len(), 1); // one root: planner
+        assert_eq!(tree[0].children.len(), 2); // tool + answer
+    }
 }

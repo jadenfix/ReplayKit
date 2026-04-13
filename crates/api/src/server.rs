@@ -8,9 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
-use replaykit_core_model::{
-    ArtifactId, BranchRequest, PatchManifest, PatchType, RunId, SpanId, Value,
-};
+use replaykit_core_model::{ArtifactId, BranchRequest, PatchManifest, RunId, SpanId, Value};
 use replaykit_replay_engine::ExecutorRegistry;
 use replaykit_storage::Storage;
 
@@ -18,7 +16,7 @@ use crate::ReplayKitService;
 use crate::errors::{ApiError, ApiErrorBody};
 use crate::views::{
     ArtifactPreviewView, BranchExecutionView, BranchPlanView, DependencyView, ReplayJobView,
-    RunDiffSummaryView, RunSummaryView, RunTreeView, SpanDetailView, TreeNodeView,
+    RunDiffSummaryView, RunSummaryView, RunTreeView, SpanDetailView,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +42,52 @@ fn err_response(err: ApiError) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Shared request types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct BranchCommandRequest {
+    pub source_run_id: String,
+    pub fork_span_id: String,
+    pub patch_type: String,
+    pub replacement: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub target_artifact_id: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ComputeDiffRequest {
+    pub source_run_id: String,
+    pub target_run_id: String,
+}
+
+pub fn parse_patch_type(s: &str) -> Result<replaykit_core_model::PatchType, ApiErrorBody> {
+    use replaykit_core_model::PatchType;
+    match s {
+        "prompt_edit" => Ok(PatchType::PromptEdit),
+        "tool_output_override" => Ok(PatchType::ToolOutputOverride),
+        "env_var_override" => Ok(PatchType::EnvVarOverride),
+        "model_config_edit" => Ok(PatchType::ModelConfigEdit),
+        "retrieval_context_override" => Ok(PatchType::RetrievalContextOverride),
+        "snapshot_override" => Ok(PatchType::SnapshotOverride),
+        other => Err(ApiErrorBody::invalid_input(format!(
+            "unknown patch_type: {other}"
+        ))),
+    }
+}
+
+pub fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -55,6 +99,10 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route("/api/v1/runs", get(list_runs::<S, E>))
         .route("/api/v1/runs/{run_id}", get(get_run::<S, E>))
         .route("/api/v1/runs/{run_id}/tree", get(get_run_tree::<S, E>))
+        .route(
+            "/api/v1/runs/{run_id}/timeline",
+            get(get_run_timeline::<S, E>),
+        )
         .route(
             "/api/v1/runs/{run_id}/spans/{span_id}",
             get(get_span_detail::<S, E>),
@@ -75,6 +123,7 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         // Command endpoints
         .route("/api/v1/branches", post(create_branch::<S, E>))
         .route("/api/v1/branches/plan", post(plan_branch::<S, E>))
+        .route("/api/v1/diffs", post(compute_diff::<S, E>))
         .with_state(service)
 }
 
@@ -114,17 +163,24 @@ async fn get_run_tree<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         Err(e) => return err_response(e),
     };
     match svc.run_tree(&rid) {
-        Ok(nodes) => {
-            let view = RunTreeView {
-                run_id: run.run_id.0.clone(),
-                title: run.title.clone(),
-                status: run.status,
-                nodes: nodes.iter().map(TreeNodeView::from_tree_node).collect(),
-            };
-            Json(view).into_response()
-        }
+        Ok(nodes) => Json(RunTreeView::from_parts(&run, &nodes)).into_response(),
         Err(e) => err_response(e),
     }
+}
+
+/// Stub: timeline is not yet supported. Returns 501 Not Implemented.
+async fn get_run_timeline<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(_svc): State<AppState<S, E>>,
+    Path(_run_id): Path<String>,
+) -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "code": "not_implemented",
+            "message": "timeline endpoint is not yet implemented; use /tree for span hierarchy"
+        })),
+    )
+        .into_response()
 }
 
 async fn get_span_detail<S: Storage + 'static, E: ExecutorRegistry + 'static>(
@@ -191,44 +247,9 @@ async fn get_replay_job<S: Storage + 'static, E: ExecutorRegistry + 'static>(
 // Command handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct CreateBranchRequest {
-    source_run_id: String,
-    fork_span_id: String,
-    patch_type: String,
-    replacement: String,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    target_artifact_id: Option<String>,
-    #[serde(default)]
-    created_by: Option<String>,
-}
-
-fn parse_patch_type(s: &str) -> Result<PatchType, ApiErrorBody> {
-    match s {
-        "prompt_edit" => Ok(PatchType::PromptEdit),
-        "tool_output_override" => Ok(PatchType::ToolOutputOverride),
-        "env_var_override" => Ok(PatchType::EnvVarOverride),
-        "model_config_edit" => Ok(PatchType::ModelConfigEdit),
-        "retrieval_context_override" => Ok(PatchType::RetrievalContextOverride),
-        "snapshot_override" => Ok(PatchType::SnapshotOverride),
-        other => Err(ApiErrorBody::invalid_input(format!(
-            "unknown patch_type: {other}"
-        ))),
-    }
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 async fn create_branch<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     State(svc): State<AppState<S, E>>,
-    Json(body): Json<CreateBranchRequest>,
+    Json(body): Json<BranchCommandRequest>,
 ) -> Response {
     let patch_type = match parse_patch_type(&body.patch_type) {
         Ok(pt) => pt,
@@ -262,23 +283,9 @@ async fn create_branch<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct PlanBranchRequest {
-    source_run_id: String,
-    fork_span_id: String,
-    patch_type: String,
-    replacement: String,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    target_artifact_id: Option<String>,
-    #[serde(default)]
-    created_by: Option<String>,
-}
-
 async fn plan_branch<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     State(svc): State<AppState<S, E>>,
-    Json(body): Json<PlanBranchRequest>,
+    Json(body): Json<BranchCommandRequest>,
 ) -> Response {
     let patch_type = match parse_patch_type(&body.patch_type) {
         Ok(pt) => pt,
@@ -300,6 +307,24 @@ async fn plan_branch<S: Storage + 'static, E: ExecutorRegistry + 'static>(
 
     match svc.plan_branch(&request) {
         Ok(plan) => Json(BranchPlanView::from_plan(&plan)).into_response(),
+        Err(e) => err_response(e),
+    }
+}
+
+async fn compute_diff<S: Storage + 'static, E: ExecutorRegistry + 'static>(
+    State(svc): State<AppState<S, E>>,
+    Json(body): Json<ComputeDiffRequest>,
+) -> Response {
+    match svc.diff_runs(
+        &RunId(body.source_run_id),
+        &RunId(body.target_run_id),
+        now_epoch_secs(),
+    ) {
+        Ok(diff) => (
+            StatusCode::CREATED,
+            Json(RunDiffSummaryView::from_record(&diff)),
+        )
+            .into_response(),
         Err(e) => err_response(e),
     }
 }
