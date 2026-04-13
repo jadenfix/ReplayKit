@@ -325,13 +325,25 @@ impl ArtifactPreviewView {
 pub struct ArtifactContentView {
     pub artifact_id: String,
     pub content: String,
+    pub content_encoding: &'static str,
 }
 
 impl ArtifactContentView {
     pub fn from_bytes(artifact_id: &str, bytes: &[u8]) -> Self {
-        Self {
-            artifact_id: artifact_id.to_owned(),
-            content: String::from_utf8_lossy(bytes).into_owned(),
+        match std::str::from_utf8(bytes) {
+            Ok(text) => Self {
+                artifact_id: artifact_id.to_owned(),
+                content: text.to_owned(),
+                content_encoding: "utf-8",
+            },
+            Err(_) => {
+                use base64::Engine;
+                Self {
+                    artifact_id: artifact_id.to_owned(),
+                    content: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    content_encoding: "base64",
+                }
+            }
         }
     }
 }
