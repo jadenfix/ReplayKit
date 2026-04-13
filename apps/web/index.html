@@ -3,84 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ReplayKit Web Placeholder</title>
-    <style>
-      :root {
-        color-scheme: light;
-        --bg: #f5efe2;
-        --card: #fffaf1;
-        --text: #1f1a14;
-        --muted: #6d6355;
-        --accent: #a34a28;
-        --line: #d9cdbb;
-      }
-
-      body {
-        margin: 0;
-        font-family: Georgia, "Iowan Old Style", serif;
-        background:
-          radial-gradient(circle at top left, rgba(163, 74, 40, 0.12), transparent 28rem),
-          linear-gradient(180deg, #f7f1e6 0%, var(--bg) 100%);
-        color: var(--text);
-      }
-
-      main {
-        max-width: 960px;
-        margin: 0 auto;
-        padding: 4rem 1.5rem 6rem;
-      }
-
-      .card {
-        background: var(--card);
-        border: 1px solid var(--line);
-        border-radius: 18px;
-        padding: 1.5rem;
-        box-shadow: 0 18px 48px rgba(31, 26, 20, 0.08);
-      }
-
-      h1 {
-        font-size: clamp(2.2rem, 5vw, 4rem);
-        margin: 0 0 0.8rem;
-      }
-
-      p,
-      li {
-        color: var(--muted);
-        line-height: 1.55;
-        font-size: 1.05rem;
-      }
-
-      strong {
-        color: var(--text);
-      }
-
-      code {
-        color: var(--accent);
-      }
-    </style>
+    <title>ReplayKit - Semantic Replay Debugger</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#x25B6;</text></svg>" />
   </head>
   <body>
-    <main>
-      <div class="card">
-        <h1>ReplayKit</h1>
-        <p>
-          The Rust workspace now contains the base architecture: canonical run/span
-          types, in-memory and SQLite storage backends, a collector, a replay
-          engine, a diff engine, an API service, and SDK helpers for semantic
-          instrumentation.
-        </p>
-        <p>
-          The next frontend step is to replace this placeholder with a real local web
-          app that reads the API and renders the run list, trace tree, span inspector,
-          branch flow, and diff views.
-        </p>
-        <ul>
-          <li><strong>Core model</strong>: shared contracts for runs, spans, artifacts, snapshots, edges, branches, and diffs.</li>
-          <li><strong>Replay engine</strong>: dirty-set planning, branch execution, and blocked replay semantics.</li>
-          <li><strong>API layer</strong>: one typed boundary for the eventual UI and CLI.</li>
-        </ul>
-        <p>Run <code>cargo run -p replaykit-cli -- demo</code> to exercise the current base architecture.</p>
-      </div>
-    </main>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -1,0 +1,114 @@
+import type { ArtifactRecord } from '../types';
+
+interface ArtifactViewerProps {
+  artifacts: ArtifactRecord[];
+  selectedSpanId: string | null;
+}
+
+export function ArtifactViewer({ artifacts, selectedSpanId }: ArtifactViewerProps) {
+  if (!selectedSpanId) {
+    return (
+      <div className="artifact-viewer">
+        <div className="artifact-viewer__empty">Select a span to view its artifacts</div>
+      </div>
+    );
+  }
+
+  if (artifacts.length === 0) {
+    return (
+      <div className="artifact-viewer">
+        <div className="artifact-viewer__empty">No artifacts for this span</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="artifact-viewer" data-testid="artifact-viewer">
+      {artifacts.map(a => (
+        <ArtifactPanel key={a.artifact_id} artifact={a} />
+      ))}
+    </div>
+  );
+}
+
+function ArtifactPanel({ artifact }: { artifact: ArtifactRecord }) {
+  return (
+    <div className={`artifact-panel artifact-panel--${classify(artifact.mime)}`}>
+      <div className="artifact-panel__header">
+        <span className="artifact-panel__type">{artifact.type}</span>
+        <span className="artifact-panel__mime">{artifact.mime}</span>
+        {artifact.summary && (
+          <span className="artifact-panel__summary">{artifact.summary}</span>
+        )}
+      </div>
+      <div className="artifact-panel__body">
+        <ArtifactContent artifact={artifact} />
+      </div>
+    </div>
+  );
+}
+
+function ArtifactContent({ artifact }: { artifact: ArtifactRecord }) {
+  const mime = artifact.mime;
+
+  if (mime === 'application/json') {
+    return <JsonViewer content={artifact.content} />;
+  }
+  if (mime === 'text/x-diff') {
+    return <DiffViewer content={artifact.content} />;
+  }
+  if (mime === 'text/x-shell-log') {
+    return <ShellLogViewer content={artifact.content} />;
+  }
+  // Default: plain text / code
+  return <pre className="artifact-content artifact-content--text">{artifact.content}</pre>;
+}
+
+function JsonViewer({ content }: { content: string }) {
+  let formatted: string;
+  try {
+    formatted = JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    formatted = content;
+  }
+  return <pre className="artifact-content artifact-content--json">{formatted}</pre>;
+}
+
+function DiffViewer({ content }: { content: string }) {
+  const lines = content.split('\n');
+  return (
+    <pre className="artifact-content artifact-content--diff">
+      {lines.map((line, i) => {
+        let cls = '';
+        if (line.startsWith('+') && !line.startsWith('+++')) cls = 'diff-add';
+        else if (line.startsWith('-') && !line.startsWith('---')) cls = 'diff-remove';
+        else if (line.startsWith('@@')) cls = 'diff-hunk';
+        else if (line.startsWith('---') || line.startsWith('+++')) cls = 'diff-file';
+        return <span key={i} className={cls}>{line}{'\n'}</span>;
+      })}
+    </pre>
+  );
+}
+
+function ShellLogViewer({ content }: { content: string }) {
+  const lines = content.split('\n');
+  return (
+    <pre className="artifact-content artifact-content--shell">
+      {lines.map((line, i) => {
+        let cls = '';
+        if (line.includes('FAILED')) cls = 'shell-fail';
+        else if (line.includes('ok')) cls = 'shell-ok';
+        else if (line.startsWith('----') || line.startsWith('failures:')) cls = 'shell-section';
+        return <span key={i} className={cls}>{line}{'\n'}</span>;
+      })}
+    </pre>
+  );
+}
+
+function classify(mime: string): string {
+  if (mime.includes('json')) return 'json';
+  if (mime.includes('diff')) return 'diff';
+  if (mime.includes('shell')) return 'shell';
+  if (mime.includes('rust')) return 'code';
+  return 'text';
+}
