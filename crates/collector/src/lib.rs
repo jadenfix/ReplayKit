@@ -89,6 +89,11 @@ pub struct ArtifactSpec {
     pub summary: Document,
     pub redaction: Document,
     pub created_at: u64,
+    /// Optional artifact content bytes. When provided, the collector stores
+    /// the content in the managed blob store and populates sha256, byte_len,
+    /// and blob_path automatically. When `None`, the existing caller-managed
+    /// blob_path is used as before.
+    pub content: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -305,8 +310,16 @@ impl<S: Storage> Collector<S> {
             redaction: spec.redaction,
             created_at: spec.created_at,
         };
-        self.storage.insert_artifact(artifact.clone())?;
-        Ok(artifact)
+
+        if let Some(content) = spec.content {
+            let stored = self
+                .storage
+                .store_artifact_with_content(artifact, &content)?;
+            Ok(stored)
+        } else {
+            self.storage.insert_artifact(artifact.clone())?;
+            Ok(artifact)
+        }
     }
 
     pub fn add_snapshot(
@@ -466,6 +479,7 @@ impl<S: Storage> Collector<S> {
                 summary,
                 redaction: Document::new(),
                 created_at: request.patch_manifest.created_at,
+                content: None,
             },
         )
     }
@@ -690,6 +704,7 @@ mod tests {
                     summary: Document::new(),
                     redaction: Document::new(),
                     created_at: 4,
+                    content: None,
                 },
             )
             .unwrap();
