@@ -16,7 +16,7 @@ WORKDIR /app
 COPY --from=build /app/target/release/replaykit /usr/local/bin/replaykit
 
 ENV REPLAYKIT_STORAGE=sqlite
-ENV REPLAYKIT_DB_PATH=/data/replaykit.db
+ENV REPLAYKIT_DATA_ROOT=/data
 
 VOLUME ["/data"]
 

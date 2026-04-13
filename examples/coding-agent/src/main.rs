@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use replaykit_api::ReplayKitService;
 use replaykit_core_model::{ArtifactType, RunStatus, RunTreeNode};
-use replaykit_replay_engine::NoopExecutorRegistry;
+use replaykit_replay_engine::executors::CompositeExecutorRegistry;
 use replaykit_sdk_rust_tracing::{
     SemanticSession, file_read, file_write, model_call, planner_step, shell_command,
     summary_from_pairs,
@@ -162,7 +162,7 @@ fn main() {
     );
 
     // Demonstrate that the API service can consume the captured data.
-    let service = ReplayKitService::new(storage, NoopExecutorRegistry);
+    let service = ReplayKitService::new(storage, CompositeExecutorRegistry::new());
     let runs = service.list_runs().expect("list runs");
     println!("\nStored {} run(s) in memory", runs.len());
 
@@ -264,7 +264,7 @@ mod tests {
         let storage = Arc::new(InMemoryStorage::new());
         let run = build_run(storage.clone());
 
-        let service = ReplayKitService::new(storage, NoopExecutorRegistry);
+        let service = ReplayKitService::new(storage, CompositeExecutorRegistry::new());
         let tree = service.run_tree(&run.run_id).unwrap();
 
         // Root should be the planner.

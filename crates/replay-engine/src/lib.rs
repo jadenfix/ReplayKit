@@ -1,3 +1,5 @@
+pub mod executors;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -308,26 +310,37 @@ impl<S: Storage, E: ExecutorRegistry> ReplayEngine<S, E> {
 
             reset_span_for_replay(&mut target_span);
             if self.executors.supports(&target_span) {
-                let result = self.executors.execute(&target_span, &execution_context)?;
-                let output_artifact_ids = self.persist_executor_artifacts(
-                    &target_run_id,
-                    &target_span.span_id,
-                    result.output_artifacts,
-                )?;
-                let snapshot_id = self.persist_executor_snapshot(
-                    &target_run_id,
-                    &target_span.span_id,
-                    result.snapshot,
-                )?;
-                target_span.status = result.status;
-                target_span.output_artifact_ids = output_artifact_ids;
-                target_span.output_fingerprint = result.output_fingerprint;
-                target_span.snapshot_id = snapshot_id;
-                target_span.error_summary = result.error_summary;
-                target_span.cost = result.cost;
-                target_span.ended_at = Some(now);
-                self.storage.upsert_span(target_span)?;
-                continue;
+                match self.executors.execute(&target_span, &execution_context) {
+                    Ok(result) => {
+                        let output_artifact_ids = self.persist_executor_artifacts(
+                            &target_run_id,
+                            &target_span.span_id,
+                            result.output_artifacts,
+                        )?;
+                        let snapshot_id = self.persist_executor_snapshot(
+                            &target_run_id,
+                            &target_span.span_id,
+                            result.snapshot,
+                        )?;
+                        target_span.status = result.status;
+                        target_span.output_artifact_ids = output_artifact_ids;
+                        target_span.output_fingerprint = result.output_fingerprint;
+                        target_span.snapshot_id = snapshot_id;
+                        target_span.error_summary = result.error_summary;
+                        target_span.cost = result.cost;
+                        target_span.ended_at = Some(now);
+                        self.storage.upsert_span(target_span)?;
+                        continue;
+                    }
+                    Err(ReplayError::Blocked(msg)) => {
+                        target_span.status = SpanStatus::Blocked;
+                        target_span.ended_at = Some(now);
+                        target_span.error_summary = Some(format!("replay blocked: {msg}"));
+                        self.storage.upsert_span(target_span)?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             target_span.status = SpanStatus::Blocked;

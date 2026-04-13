@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     environment:
       REPLAYKIT_STORAGE: sqlite
-      REPLAYKIT_DB_PATH: /data/replaykit.db
+      REPLAYKIT_DATA_ROOT: /data
     volumes:
       - replaykit-data:/data
     command: ["demo-branch"]
