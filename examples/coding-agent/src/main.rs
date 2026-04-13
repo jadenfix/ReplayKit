@@ -65,6 +65,9 @@ fn build_run(storage: Arc<InMemoryStorage>) -> replaykit_core_model::RunRecord {
             model_call("generate fix")
                 .provider("anthropic")
                 .model("claude-sonnet-4-6")
+                .model_request_json(
+                    r#"{"messages":[{"role":"user","content":"fix the failing auth test"}]}"#,
+                )
                 .span_id("llm-call")
                 .parent(&planner.span_id)
                 .times(116, 130)

@@ -118,6 +118,9 @@ pub fn generate_failed_coding_agent() -> FixtureRun {
             model_call("generate fix")
                 .provider("anthropic")
                 .model("claude-sonnet-4-6")
+                .model_request_json(
+                    r#"{"messages":[{"role":"user","content":"fix the failing auth test"}]}"#,
+                )
                 .span_id("llm-001")
                 .parent(&planner.span_id)
                 .times(116, 130)
@@ -271,6 +274,9 @@ pub fn generate_success_coding_agent() -> FixtureRun {
             model_call("generate fix")
                 .provider("openai")
                 .model("gpt-5.4")
+                .model_request_json(
+                    r#"{"messages":[{"role":"user","content":"fix the failing auth test"}]}"#,
+                )
                 .span_id("llm-001")
                 .parent(&planner.span_id)
                 .times(216, 230)
@@ -585,10 +591,10 @@ mod tests {
     #[test]
     fn prompt_edit_with_fake_model_unblocks_llm_span() {
         use replaykit_core_model::{BranchRequest, PatchManifest, PatchType, Value};
+        use replaykit_replay_engine::ReplayEngine;
         use replaykit_replay_engine::executors::{
             CompositeExecutorRegistry, FakeModelExecutor, ModelExecutorMode,
         };
-        use replaykit_replay_engine::ReplayEngine;
 
         let fixture = generate_failed_coding_agent();
         let storage = Arc::new(InMemoryStorage::new());
@@ -609,8 +615,13 @@ mod tests {
         // doesn't generate colliding IDs.
         use replaykit_core_model::IdKind;
         for kind in [
-            IdKind::Run, IdKind::Trace, IdKind::Branch, IdKind::ReplayJob,
-            IdKind::Diff, IdKind::Snapshot, IdKind::Event,
+            IdKind::Run,
+            IdKind::Trace,
+            IdKind::Branch,
+            IdKind::ReplayJob,
+            IdKind::Diff,
+            IdKind::Snapshot,
+            IdKind::Event,
         ] {
             let _ = storage.allocate_id(kind);
         }
@@ -623,8 +634,8 @@ mod tests {
 
         let fake = FakeModelExecutor::new("fn test_auth() { assert!(true); }")
             .with_response("generate fix", "fn test_auth() { assert!(true); }");
-        let registry = CompositeExecutorRegistry::new()
-            .with_model_mode(ModelExecutorMode::Fake(fake));
+        let registry =
+            CompositeExecutorRegistry::new().with_model_mode(ModelExecutorMode::Fake(fake));
         let engine = ReplayEngine::new(storage.clone(), registry);
 
         let request = BranchRequest {

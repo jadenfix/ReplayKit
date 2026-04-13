@@ -6,9 +6,10 @@
 //! - `FileWriteExecutor`: writes a diff artifact describing what would be written
 //! - `CompositeExecutorRegistry`: dispatches to the right executor by SpanKind
 //!
-//! LLM calls are intentionally NOT supported by CompositeExecutorRegistry.
-//! The replay engine handles LLM reuse via fingerprint matching; if a rerun is
-//! needed and no API key is configured, the span blocks explicitly.
+//! LLM calls are dispatched through a configurable model executor mode:
+//! - blocked by default
+//! - fake/deterministic for tests
+//! - passthrough stub for future live integration
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -69,10 +70,13 @@ impl ShellExecutor {
             _ => span.name.clone(),
         };
         let now = now_epoch_secs();
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&cmd_str);
+        if let Some(Value::Text(cwd)) = span.attributes.get(attrs::CWD) {
+            command.current_dir(cwd);
+        }
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd_str)
+        let output = command
             .output()
             .map_err(|e| ReplayError::Blocked(format!("failed to spawn shell: {e}")))?;
 
@@ -287,10 +291,14 @@ impl BlockedModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
+        if let Some(reason) = validate_llm_contract(span) {
+            return Err(ReplayError::Blocked(reason));
+        }
         let model = span
             .attributes
             .get(attrs::MODEL)
             .map(|v| v.to_string())
+            .or_else(|| span.executor_kind.clone())
             .unwrap_or_else(|| "unknown".into());
         Err(ReplayError::Blocked(format!(
             "LlmCall to model '{model}' requires an explicit model executor; \
@@ -299,10 +307,14 @@ impl BlockedModelExecutor {
     }
 
     pub fn why_not(&self, span: &SpanRecord) -> Option<String> {
+        if let Some(reason) = validate_llm_contract(span) {
+            return Some(reason);
+        }
         let model = span
             .attributes
             .get(attrs::MODEL)
             .map(|v| v.to_string())
+            .or_else(|| span.executor_kind.clone())
             .unwrap_or_else(|| "unknown".into());
         Some(format!(
             "LlmCall to model '{model}' blocked: no live model executor configured"
@@ -338,6 +350,9 @@ impl FakeModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
+        if let Some(reason) = validate_llm_contract(span) {
+            return Err(ReplayError::Blocked(reason));
+        }
         let response = self
             .responses
             .get(&span.name)
@@ -349,7 +364,7 @@ impl FakeModelExecutor {
             status: SpanStatus::Completed,
             output_artifacts: vec![ProducedArtifact {
                 artifact_type: ArtifactType::ModelResponse,
-                mime: "application/json".into(),
+                mime: "text/plain".into(),
                 sha256: hash.clone(),
                 byte_len: response.len(),
                 blob_path: format!("memory://fake-model/{}", hash),
@@ -378,6 +393,9 @@ impl PassthroughModelExecutor {
         span: &SpanRecord,
         _context: &ReplayExecutionContext,
     ) -> Result<ExecutionResult, ReplayError> {
+        if let Some(reason) = validate_llm_contract(span) {
+            return Err(ReplayError::Blocked(reason));
+        }
         let provider = span
             .attributes
             .get(attrs::PROVIDER)
@@ -477,10 +495,10 @@ impl ExecutorRegistry for CompositeExecutorRegistry {
             SpanKind::ShellCommand => validate_shell_contract(span),
             SpanKind::FileRead => validate_file_read_contract(span),
             SpanKind::FileWrite => validate_file_write_contract(span),
-            SpanKind::LlmCall => match &self.model_mode {
+            SpanKind::LlmCall => validate_llm_contract(span).or_else(|| match &self.model_mode {
                 ModelExecutorMode::Blocked => BlockedModelExecutor.why_not(span),
                 _ => None,
-            },
+            }),
             _ => Some(format!("no executor for span kind {:?}", span.kind)),
         }
     }
@@ -534,6 +552,18 @@ fn validate_file_write_contract(span: &SpanRecord) -> Option<String> {
     let has_path = matches!(span.attributes.get(attrs::PATH), Some(Value::Text(_)));
     if !has_path && span.name.is_empty() {
         return Some("FileWrite span has no 'path' attribute and empty name".into());
+    }
+    None
+}
+
+fn validate_llm_contract(span: &SpanRecord) -> Option<String> {
+    let has_model = matches!(span.attributes.get(attrs::MODEL), Some(Value::Text(_)))
+        || span
+            .executor_kind
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if !has_model {
+        return Some("LlmCall span has no 'model' attribute or executor kind".into());
     }
     None
 }
@@ -751,6 +781,28 @@ mod tests {
     }
 
     #[test]
+    fn shell_executor_honors_cwd_attribute() {
+        let dir = std::env::temp_dir().join("rk-test-shell-cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cwd.txt"), "cwd-data\n").unwrap();
+
+        let mut span = make_span(SpanKind::ShellCommand, "cat cwd.txt");
+        span.attributes
+            .insert(attrs::CWD.into(), Value::Text(dir.to_string_lossy().into()));
+        let result = ShellExecutor.execute_span(&span, &test_context()).unwrap();
+        assert_eq!(result.status, SpanStatus::Completed);
+        let stdout = &result.output_artifacts[0];
+        let preview = stdout.summary.get("stdout_preview").unwrap().to_string();
+        assert!(
+            preview.contains("cwd-data"),
+            "expected cwd-data in: {preview}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn shell_blocks_with_empty_name_and_no_command() {
         let span = make_span(SpanKind::ShellCommand, "");
         let result = ShellExecutor.execute_span(&span, &test_context());
@@ -765,10 +817,8 @@ mod tests {
     #[test]
     fn blocked_model_executor_reports_model_name() {
         let mut span = make_span(SpanKind::LlmCall, "test");
-        span.attributes.insert(
-            attrs::MODEL.into(),
-            Value::Text("claude-sonnet-4-6".into()),
-        );
+        span.attributes
+            .insert(attrs::MODEL.into(), Value::Text("claude-sonnet-4-6".into()));
         let result = BlockedModelExecutor.execute_span(&span, &test_context());
         match result {
             Err(ReplayError::Blocked(msg)) => {
@@ -781,7 +831,9 @@ mod tests {
     #[test]
     fn fake_model_returns_completed_with_artifact() {
         let fake = FakeModelExecutor::new("default answer");
-        let span = make_span(SpanKind::LlmCall, "test call");
+        let mut span = make_span(SpanKind::LlmCall, "test call");
+        span.attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
         let result = fake.execute_span(&span, &test_context()).unwrap();
         assert_eq!(result.status, SpanStatus::Completed);
         assert_eq!(result.output_artifacts.len(), 1);
@@ -790,6 +842,7 @@ mod tests {
             ArtifactType::ModelResponse
         );
         assert!(result.output_fingerprint.is_some());
+        assert_eq!(result.output_artifacts[0].mime, "text/plain");
         assert_eq!(
             result.output_artifacts[0].summary.get("fake"),
             Some(&Value::Text("true".into()))
@@ -798,14 +851,30 @@ mod tests {
 
     #[test]
     fn fake_model_per_span_override() {
-        let fake = FakeModelExecutor::new("default")
-            .with_response("generate fix", "custom fix");
-        let span1 = make_span(SpanKind::LlmCall, "generate fix");
-        let span2 = make_span(SpanKind::LlmCall, "other call");
+        let fake = FakeModelExecutor::new("default").with_response("generate fix", "custom fix");
+        let mut span1 = make_span(SpanKind::LlmCall, "generate fix");
+        span1
+            .attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
+        let mut span2 = make_span(SpanKind::LlmCall, "other call");
+        span2
+            .attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
 
         let r1 = fake.execute_span(&span1, &test_context()).unwrap();
         let r2 = fake.execute_span(&span2, &test_context()).unwrap();
         assert_ne!(r1.output_fingerprint, r2.output_fingerprint);
+    }
+
+    #[test]
+    fn fake_model_blocks_without_minimum_contract() {
+        let fake = FakeModelExecutor::new("default");
+        let span = make_span(SpanKind::LlmCall, "test call");
+        let result = fake.execute_span(&span, &test_context());
+        match result {
+            Err(ReplayError::Blocked(msg)) => assert!(msg.contains("model"), "{msg}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     #[test]
@@ -861,10 +930,12 @@ mod tests {
 
     #[test]
     fn composite_with_fake_model_executes_llm() {
-        let registry = CompositeExecutorRegistry::new().with_model_mode(
-            ModelExecutorMode::Fake(FakeModelExecutor::new("test response")),
-        );
-        let span = make_span(SpanKind::LlmCall, "test call");
+        let registry = CompositeExecutorRegistry::new().with_model_mode(ModelExecutorMode::Fake(
+            FakeModelExecutor::new("test response"),
+        ));
+        let mut span = make_span(SpanKind::LlmCall, "test call");
+        span.attributes
+            .insert(attrs::MODEL.into(), Value::Text("gpt-5.4".into()));
         let result = registry.execute(&span, &test_context()).unwrap();
         assert_eq!(result.status, SpanStatus::Completed);
         assert_eq!(result.output_artifacts.len(), 1);

@@ -507,7 +507,7 @@ mod tests {
             spec.attributes.get("model"),
             Some(&Value::Text("claude-sonnet-4-6".into()))
         );
-        assert!(spec.attributes.get("model_request_json").is_some());
+        assert!(spec.attributes.contains_key("model_request_json"));
     }
 
     #[test]
