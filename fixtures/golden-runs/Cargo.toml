@@ -13,4 +13,3 @@ path = "src/lib.rs"
 replaykit-core-model = { path = "../../crates/core-model" }
 replaykit-storage = { path = "../../crates/storage" }
 replaykit-sdk-rust-tracing = { path = "../../crates/sdk-rust-tracing" }
-serde_json = "1"

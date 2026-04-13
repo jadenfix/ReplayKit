@@ -215,7 +215,6 @@ dependencies = [
  "replaykit-core-model",
  "replaykit-sdk-rust-tracing",
  "replaykit-storage",
- "serde_json",
 ]
 
 [[package]]
@@ -233,7 +232,6 @@ dependencies = [
  "replaykit-collector",
  "replaykit-core-model",
  "replaykit-storage",
- "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
