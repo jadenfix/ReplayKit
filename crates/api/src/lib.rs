@@ -191,21 +191,15 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
         let mut spans = self.storage.list_spans(run_id)?;
         spans.sort_by_key(|s| s.started_at);
 
+        let span_map = spans
+            .iter()
+            .map(|span| (span.span_id.clone(), span.parent_span_id.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut depth_map = BTreeMap::<SpanId, usize>::new();
-        // Two passes to handle children appearing before parents in time order
+
         for span in &spans {
-            let depth = match &span.parent_span_id {
-                None => 0,
-                Some(pid) => depth_map.get(pid).map_or(0, |d| d + 1),
-            };
+            let depth = timeline_depth(&span.span_id, &span_map, &mut depth_map);
             depth_map.insert(span.span_id.clone(), depth);
-        }
-        for span in &spans {
-            if let Some(pid) = &span.parent_span_id
-                && let Some(&parent_depth) = depth_map.get(pid)
-            {
-                depth_map.insert(span.span_id.clone(), parent_depth + 1);
-            }
         }
 
         Ok(spans
@@ -370,25 +364,73 @@ fn find_deepest_failure(nodes: &[RunTreeNode]) -> Option<String> {
     best.map(|(_, id)| id)
 }
 
+fn timeline_depth(
+    span_id: &SpanId,
+    parent_map: &BTreeMap<SpanId, Option<SpanId>>,
+    memo: &mut BTreeMap<SpanId, usize>,
+) -> usize {
+    if let Some(depth) = memo.get(span_id) {
+        return *depth;
+    }
+
+    let depth = match parent_map.get(span_id).and_then(|parent| parent.clone()) {
+        Some(parent_id) => timeline_depth(&parent_id, parent_map, memo) + 1,
+        None => 0,
+    };
+    memo.insert(span_id.clone(), depth);
+    depth
+}
+
 fn find_deepest_failing_dep(
     span_id: &SpanId,
     span_map: &BTreeMap<SpanId, &SpanRecord>,
     edges: &[SpanEdgeRecord],
 ) -> Option<String> {
-    let deps: Vec<&SpanEdgeRecord> = edges
-        .iter()
-        .filter(|e| e.kind == EdgeKind::DataDependsOn && e.to_span_id == *span_id)
-        .collect();
-
-    for dep in &deps {
-        if let Some(from) = span_map.get(&dep.from_span_id)
-            && from.status == SpanStatus::Failed
-        {
-            return find_deepest_failing_dep(&dep.from_span_id, span_map, edges)
-                .or_else(|| Some(dep.from_span_id.0.clone()));
+    fn walk(
+        span_id: &SpanId,
+        span_map: &BTreeMap<SpanId, &SpanRecord>,
+        edges: &[SpanEdgeRecord],
+        visiting: &mut std::collections::BTreeSet<SpanId>,
+    ) -> Option<(usize, String)> {
+        if !visiting.insert(span_id.clone()) {
+            return None;
         }
+
+        let mut best = None;
+        for edge in edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DataDependsOn && e.from_span_id == *span_id)
+        {
+            let dependency_id = &edge.to_span_id;
+            let Some(dependency) = span_map.get(dependency_id) else {
+                continue;
+            };
+            if dependency.status != SpanStatus::Failed {
+                continue;
+            }
+
+            let candidate = walk(dependency_id, span_map, edges, visiting)
+                .map(|(depth, id)| (depth + 1, id))
+                .or_else(|| Some((1, dependency_id.0.clone())));
+
+            if candidate.as_ref().is_some_and(|(depth, _)| {
+                best.as_ref().is_none_or(|(best_depth, _)| depth > best_depth)
+            }) {
+                best = candidate;
+            }
+        }
+
+        visiting.remove(span_id);
+        best
     }
-    None
+
+    walk(
+        span_id,
+        span_map,
+        edges,
+        &mut std::collections::BTreeSet::new(),
+    )
+    .map(|(_, id)| id)
 }
 
 fn build_path_to_root(target: &SpanId, span_map: &BTreeMap<SpanId, &SpanRecord>) -> Vec<String> {
@@ -418,30 +460,39 @@ fn build_retry_groups(
     let span_map: BTreeMap<SpanId, &SpanRecord> =
         spans.iter().map(|s| (s.span_id.clone(), s)).collect();
 
-    // Build connected components via retry edges
-    let mut groups: Vec<std::collections::BTreeSet<SpanId>> = Vec::new();
+    let mut adjacency = BTreeMap::<SpanId, Vec<SpanId>>::new();
     for edge in &retry_edges {
-        let from = &edge.from_span_id;
-        let to = &edge.to_span_id;
-        let mut found = None;
-        for (i, group) in groups.iter().enumerate() {
-            if group.contains(from) || group.contains(to) {
-                found = Some(i);
-                break;
+        adjacency
+            .entry(edge.from_span_id.clone())
+            .or_default()
+            .push(edge.to_span_id.clone());
+        adjacency
+            .entry(edge.to_span_id.clone())
+            .or_default()
+            .push(edge.from_span_id.clone());
+    }
+
+    let mut groups = Vec::new();
+    let mut visited = std::collections::BTreeSet::<SpanId>::new();
+    for span_id in adjacency.keys() {
+        if visited.contains(span_id) {
+            continue;
+        }
+
+        let mut group = std::collections::BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([span_id.clone()]);
+        visited.insert(span_id.clone());
+
+        while let Some(current) = queue.pop_front() {
+            group.insert(current.clone());
+            for neighbor in adjacency.get(&current).into_iter().flatten() {
+                if visited.insert(neighbor.clone()) {
+                    queue.push_back(neighbor.clone());
+                }
             }
         }
-        match found {
-            Some(i) => {
-                groups[i].insert(from.clone());
-                groups[i].insert(to.clone());
-            }
-            None => {
-                let mut g = std::collections::BTreeSet::new();
-                g.insert(from.clone());
-                g.insert(to.clone());
-                groups.push(g);
-            }
-        }
+
+        groups.push(group);
     }
 
     groups

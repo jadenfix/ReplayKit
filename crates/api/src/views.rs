@@ -1,8 +1,8 @@
 use replaykit_core_model::{
     ArtifactRecord, ArtifactType, BranchPlan, BranchRecord, CostMetrics, DirtyReason,
-    DirtySpanRecord, Document, EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus, ReplayMode,
-    ReplayPolicy, RunDiffRecord, RunRecord, RunStatus, RunTreeNode, SpanEdgeRecord, SpanKind,
-    SpanRecord, SpanStatus, Value,
+    DirtySpanRecord, Document, EdgeKind, FailureClass, ReplayJobRecord, ReplayJobStatus,
+    ReplayMode, ReplayPolicy, RunDiffRecord, RunRecord, RunStatus, RunTreeNode, SpanEdgeRecord,
+    SpanKind, SpanRecord, SpanStatus, Value,
 };
 use serde::Serialize;
 
@@ -113,6 +113,119 @@ impl TreeNodeView {
 }
 
 // ---------------------------------------------------------------------------
+// Timeline views
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TimelineView {
+    pub run_id: String,
+    pub title: String,
+    pub status: RunStatus,
+    pub total_started_at: u64,
+    pub total_ended_at: Option<u64>,
+    pub entries: Vec<TimelineEntryView>,
+}
+
+impl TimelineView {
+    pub fn from_parts(run: &RunRecord, entries: Vec<TimelineEntryView>) -> Self {
+        let total_started_at = entries
+            .iter()
+            .map(|e| e.started_at)
+            .min()
+            .unwrap_or(run.started_at);
+        let total_ended_at = entries
+            .iter()
+            .filter_map(|e| e.ended_at)
+            .max()
+            .or(run.ended_at);
+        Self {
+            run_id: run.run_id.0.clone(),
+            title: run.title.clone(),
+            status: run.status,
+            total_started_at,
+            total_ended_at,
+            entries,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TimelineEntryView {
+    pub span_id: String,
+    pub name: String,
+    pub kind: SpanKind,
+    pub status: SpanStatus,
+    pub status_label: &'static str,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+    pub depth: usize,
+    pub parent_span_id: Option<String>,
+    pub error_summary: Option<String>,
+}
+
+impl TimelineEntryView {
+    pub fn from_span(span: &SpanRecord, depth: usize) -> Self {
+        Self {
+            span_id: span.span_id.0.clone(),
+            name: span.name.clone(),
+            kind: span.kind,
+            status: span.status,
+            status_label: span_status_label(span.status),
+            started_at: span.started_at,
+            ended_at: span.ended_at,
+            depth,
+            parent_span_id: span.parent_span_id.as_ref().map(|id| id.0.clone()),
+            error_summary: span.error_summary.clone(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Failure forensics view
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FailureForensicsView {
+    pub run_id: String,
+    pub has_failure: bool,
+    pub first_failed_span_id: Option<String>,
+    pub deepest_failed_span_id: Option<String>,
+    pub deepest_failing_dependency_id: Option<String>,
+    pub failure_path: Vec<String>,
+    pub blocked_spans: Vec<BlockedSpanView>,
+    pub retry_groups: Vec<RetryGroupView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BlockedSpanView {
+    pub span_id: String,
+    pub name: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RetryGroupView {
+    pub span_ids: Vec<String>,
+    pub final_status: SpanStatus,
+    pub final_status_label: &'static str,
+}
+
+// ---------------------------------------------------------------------------
+// Diff span-level view
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SpanDiffView {
+    pub span_id_source: String,
+    pub span_id_target: String,
+    pub name: String,
+    pub status_change: Option<String>,
+    pub duration_ms_delta: Option<i64>,
+    pub output_changed: bool,
+    pub dirty_reason: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Span detail view
 // ---------------------------------------------------------------------------
 
@@ -161,7 +274,11 @@ impl SpanDetailView {
             executor_kind: s.executor_kind.clone(),
             executor_version: s.executor_version.clone(),
             input_artifact_ids: s.input_artifact_ids.iter().map(|id| id.0.clone()).collect(),
-            output_artifact_ids: s.output_artifact_ids.iter().map(|id| id.0.clone()).collect(),
+            output_artifact_ids: s
+                .output_artifact_ids
+                .iter()
+                .map(|id| id.0.clone())
+                .collect(),
             input_fingerprint: s.input_fingerprint.clone(),
             output_fingerprint: s.output_fingerprint.clone(),
             environment_fingerprint: s.environment_fingerprint.clone(),
@@ -293,11 +410,73 @@ pub struct RunDiffSummaryView {
     pub changed_span_count: usize,
     pub changed_artifact_count: usize,
     pub first_divergent_span_id: Option<String>,
+    pub span_diffs: Vec<SpanDiffView>,
+    pub latency_ms_delta: Option<i64>,
+    pub token_delta: Option<i64>,
+    pub final_output_changed: bool,
     pub summary: Document,
 }
 
 impl RunDiffSummaryView {
     pub fn from_record(d: &RunDiffRecord) -> Self {
+        let span_diffs = d
+            .summary
+            .get("span_diffs")
+            .and_then(|v| match v {
+                Value::Array(arr) => Some(
+                    arr.iter()
+                        .filter_map(|entry| match entry {
+                            Value::Object(map) => Some(SpanDiffView {
+                                span_id_source: extract_text(map, "span_id_source"),
+                                span_id_target: extract_text(map, "span_id_target"),
+                                name: extract_text(map, "name"),
+                                status_change: map.get("status_change").and_then(|v| match v {
+                                    Value::Text(t) => Some(t.clone()),
+                                    _ => None,
+                                }),
+                                duration_ms_delta: map.get("duration_ms_delta").and_then(
+                                    |v| match v {
+                                        Value::Int(i) => Some(*i),
+                                        _ => None,
+                                    },
+                                ),
+                                output_changed: map
+                                    .get("output_changed")
+                                    .and_then(|v| match v {
+                                        Value::Bool(b) => Some(*b),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(false),
+                                dirty_reason: map.get("dirty_reason").and_then(|v| match v {
+                                    Value::Text(t) => Some(t.clone()),
+                                    _ => None,
+                                }),
+                            }),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        let latency_ms_delta = d.summary.get("latency_ms_delta").and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        });
+        let token_delta = d.summary.get("token_delta").and_then(|v| match v {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        });
+        let final_output_changed = d
+            .summary
+            .get("final_output_changed")
+            .and_then(|v| match v {
+                Value::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         Self {
             diff_id: d.diff_id.0.clone(),
             source_run_id: d.source_run_id.0.clone(),
@@ -307,9 +486,22 @@ impl RunDiffSummaryView {
             changed_span_count: d.changed_span_count,
             changed_artifact_count: d.changed_artifact_count,
             first_divergent_span_id: d.first_divergent_span_id.as_ref().map(|id| id.0.clone()),
+            span_diffs,
+            latency_ms_delta,
+            token_delta,
+            final_output_changed,
             summary: d.summary.clone(),
         }
     }
+}
+
+fn extract_text(map: &Document, key: &str) -> String {
+    map.get(key)
+        .and_then(|v| match v {
+            Value::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
