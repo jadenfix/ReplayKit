@@ -9,6 +9,21 @@ authors.workspace = true
 name = "replaykit_collector"
 path = "src/lib.rs"
 
+[[bin]]
+name = "replaykit-collector"
+path = "src/bin/replaykit_collector.rs"
+
 [dependencies]
 replaykit-core-model = { path = "../core-model" }
 replaykit-storage = { path = "../storage" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
+tower = "0.5"

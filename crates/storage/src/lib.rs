@@ -16,9 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-pub use blob::{
-    BlobIntegrity, BlobRef, BlobStore, InMemoryBlobStore, LocalBlobStore, sha256_hex,
-};
+pub use blob::{BlobIntegrity, BlobRef, BlobStore, InMemoryBlobStore, LocalBlobStore, sha256_hex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -38,6 +36,8 @@ impl fmt::Display for StorageError {
         }
     }
 }
+
+impl std::error::Error for StorageError {}
 
 pub trait Storage: Send + Sync {
     fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError>;
@@ -731,7 +731,11 @@ impl Storage for InMemoryStorage {
         let blob_ref = self.blob_store.store(content)?;
         artifact.sha256 = blob_ref.sha256.clone();
         artifact.byte_len = blob_ref.byte_len as usize;
-        artifact.blob_path = self.blob_store.blob_path(&blob_ref).to_string_lossy().to_string();
+        artifact.blob_path = self
+            .blob_store
+            .blob_path(&blob_ref)
+            .to_string_lossy()
+            .to_string();
         self.insert_artifact(artifact.clone())?;
         Ok(artifact)
     }
@@ -1693,9 +1697,7 @@ impl Storage for SqliteStorage {
         content: &[u8],
     ) -> Result<ArtifactRecord, StorageError> {
         let blob_store = self.blob_store.as_ref().ok_or_else(|| {
-            StorageError::Internal(
-                "cannot store artifact content: no blob store configured".into(),
-            )
+            StorageError::Internal("cannot store artifact content: no blob store configured".into())
         })?;
 
         // Store blob first (safe orphan on DB failure).
@@ -1717,9 +1719,7 @@ impl Storage for SqliteStorage {
         artifact_id: &ArtifactId,
     ) -> Result<Vec<u8>, StorageError> {
         let blob_store = self.blob_store.as_ref().ok_or_else(|| {
-            StorageError::Internal(
-                "cannot read artifact content: no blob store configured".into(),
-            )
+            StorageError::Internal("cannot read artifact content: no blob store configured".into())
         })?;
         let artifact = self.get_artifact(run_id, artifact_id)?;
         let blob_ref = BlobRef {
@@ -2316,7 +2316,7 @@ mod tests {
             artifact_type: ArtifactType::ToolOutput,
             mime: "text/plain".into(),
             sha256: String::new(), // will be set by store
-            byte_len: 0,          // will be set by store
+            byte_len: 0,           // will be set by store
             blob_path: String::new(),
             summary: BTreeMap::new(),
             redaction: BTreeMap::new(),
@@ -2511,12 +2511,8 @@ mod tests {
             created_at: 2,
         };
 
-        let stored1 = storage
-            .store_artifact_with_content(art1, content)
-            .unwrap();
-        let stored2 = storage
-            .store_artifact_with_content(art2, content)
-            .unwrap();
+        let stored1 = storage.store_artifact_with_content(art1, content).unwrap();
+        let stored2 = storage.store_artifact_with_content(art2, content).unwrap();
 
         // Same blob path (content-addressed dedup).
         assert_eq!(stored1.blob_path, stored2.blob_path);

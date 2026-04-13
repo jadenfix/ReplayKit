@@ -122,13 +122,11 @@ impl BlobStore for LocalBlobStore {
             ))
         })?;
 
-        file.write_all(data).map_err(|e| {
-            StorageError::Internal(format!("failed to write blob data: {e}"))
-        })?;
+        file.write_all(data)
+            .map_err(|e| StorageError::Internal(format!("failed to write blob data: {e}")))?;
 
-        file.sync_all().map_err(|e| {
-            StorageError::Internal(format!("failed to fsync blob file: {e}"))
-        })?;
+        file.sync_all()
+            .map_err(|e| StorageError::Internal(format!("failed to fsync blob file: {e}")))?;
 
         drop(file);
 
@@ -198,9 +196,7 @@ impl BlobStore for LocalBlobStore {
         }
 
         let data = fs::read(&path).map_err(|e| {
-            StorageError::Internal(format!(
-                "failed to read blob for verification: {e}"
-            ))
+            StorageError::Internal(format!("failed to read blob for verification: {e}"))
         })?;
 
         let actual_hash = sha256_hex(&data);
@@ -239,9 +235,10 @@ impl BlobStore for InMemoryBlobStore {
     fn store(&self, data: &[u8]) -> Result<BlobRef, StorageError> {
         let hash = sha256_hex(data);
         let byte_len = data.len() as u64;
-        let mut blobs = self.blobs.write().map_err(|_| {
-            StorageError::Internal("failed to lock in-memory blob store".into())
-        })?;
+        let mut blobs = self
+            .blobs
+            .write()
+            .map_err(|_| StorageError::Internal("failed to lock in-memory blob store".into()))?;
         blobs.entry(hash.clone()).or_insert_with(|| data.to_vec());
         Ok(BlobRef {
             sha256: hash,
@@ -250,9 +247,10 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     fn read(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, StorageError> {
-        let blobs = self.blobs.read().map_err(|_| {
-            StorageError::Internal("failed to lock in-memory blob store".into())
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|_| StorageError::Internal("failed to lock in-memory blob store".into()))?;
         blobs
             .get(&blob_ref.sha256)
             .cloned()
@@ -260,16 +258,18 @@ impl BlobStore for InMemoryBlobStore {
     }
 
     fn exists(&self, blob_ref: &BlobRef) -> Result<bool, StorageError> {
-        let blobs = self.blobs.read().map_err(|_| {
-            StorageError::Internal("failed to lock in-memory blob store".into())
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|_| StorageError::Internal("failed to lock in-memory blob store".into()))?;
         Ok(blobs.contains_key(&blob_ref.sha256))
     }
 
     fn verify(&self, blob_ref: &BlobRef) -> Result<BlobIntegrity, StorageError> {
-        let blobs = self.blobs.read().map_err(|_| {
-            StorageError::Internal("failed to lock in-memory blob store".into())
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|_| StorageError::Internal("failed to lock in-memory blob store".into()))?;
         match blobs.get(&blob_ref.sha256) {
             None => Ok(BlobIntegrity::Missing),
             Some(data) => {
