@@ -26,6 +26,7 @@ export default function App() {
     loadDiff,
     jumpToSpan,
     setCenterView,
+    clearError,
   } = useAppState(provider);
 
   const tabs: { id: BottomTab; label: string }[] = [
@@ -80,70 +81,78 @@ export default function App() {
   const timelineAvailable = state.timeline !== null || state.loading.timeline;
 
   return (
-    <Layout
-      left={
-        <RunList
-          runs={state.runs}
-          selectedRunId={state.selectedRunId}
-          loading={state.loading.runs}
-          onSelectRun={selectRun}
-        />
-      }
-      center={
-        <>
-          {state.selectedRunId && (
-            <div className="center-view-toggle">
-              <button
-                className={`center-view-toggle__btn ${state.centerView === 'tree' ? 'center-view-toggle__btn--active' : ''}`}
-                onClick={() => setCenterView('tree')}
-              >
-                Tree
-              </button>
-              <button
-                className={`center-view-toggle__btn ${state.centerView === 'timeline' ? 'center-view-toggle__btn--active' : ''}`}
-                onClick={() => setCenterView('timeline')}
-                disabled={!timelineAvailable}
-              >
-                Timeline
-              </button>
-            </div>
-          )}
-          {state.centerView === 'tree' ? (
-            <RunTree
-              tree={state.runTree}
-              selectedSpanId={state.selectedSpanId}
-              loading={state.loading.tree}
-              onSelectSpan={selectSpan}
-              onBranch={startBranchDraft}
-            />
-          ) : (
-            <TimelineView
-              timeline={state.timeline}
-              selectedSpanId={state.selectedSpanId}
-              loading={state.loading.timeline}
-              onSelectSpan={selectSpan}
-            />
-          )}
-        </>
-      }
-      right={
-        <SpanInspector
-          span={state.spanDetail}
-          artifacts={state.spanArtifacts}
-          edges={state.spanEdges}
-          loading={state.loading.detail}
-          onBranch={startBranchDraft}
-        />
-      }
-      bottom={bottomContent}
-      failureNav={
-        <FailureNav
-          tree={state.runTree}
-          edges={state.spanEdges}
-          forensics={state.forensics}
-          onJumpToSpan={jumpToSpan}
-        />
-      }
-    />
+    <>
+      {state.error && (
+        <div className="error-banner" role="alert">
+          {state.error}
+          <button onClick={() => clearError()}>Dismiss</button>
+        </div>
+      )}
+      <Layout
+        left={
+          <RunList
+            runs={state.runs}
+            selectedRunId={state.selectedRunId}
+            loading={state.loading.runs}
+            onSelectRun={selectRun}
+          />
+        }
+        center={
+          <>
+            {state.selectedRunId && (
+              <div className="center-view-toggle">
+                <button
+                  className={`center-view-toggle__btn ${state.centerView === 'tree' ? 'center-view-toggle__btn--active' : ''}`}
+                  onClick={() => setCenterView('tree')}
+                >
+                  Tree
+                </button>
+                <button
+                  className={`center-view-toggle__btn ${state.centerView === 'timeline' ? 'center-view-toggle__btn--active' : ''}`}
+                  onClick={() => setCenterView('timeline')}
+                  disabled={!timelineAvailable}
+                >
+                  Timeline
+                </button>
+              </div>
+            )}
+            {state.centerView === 'tree' ? (
+              <RunTree
+                tree={state.runTree}
+                selectedSpanId={state.selectedSpanId}
+                loading={state.loading.tree}
+                onSelectSpan={selectSpan}
+                onBranch={startBranchDraft}
+              />
+            ) : (
+              <TimelineView
+                timeline={state.timeline}
+                selectedSpanId={state.selectedSpanId}
+                loading={state.loading.timeline}
+                onSelectSpan={selectSpan}
+              />
+            )}
+          </>
+        }
+        right={
+          <SpanInspector
+            span={state.spanDetail}
+            artifacts={state.spanArtifacts}
+            edges={state.spanEdges}
+            loading={state.loading.detail}
+            onBranch={startBranchDraft}
+          />
+        }
+        bottom={bottomContent}
+        failureNav={
+          <FailureNav
+            tree={state.runTree}
+            edges={state.spanEdges}
+            forensics={state.forensics}
+            onJumpToSpan={jumpToSpan}
+          />
+        }
+      />
+    </>
   );
 }

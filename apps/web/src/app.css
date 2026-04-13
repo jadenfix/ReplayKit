@@ -1134,6 +1134,26 @@ pre {
 
 .failure-nav__chain-depth { color: var(--text-muted); font-size: 11px; }
 
+/* ── Error Banner ───────────────────────────────────────────────── */
+
+.error-banner {
+  background: #fef2f2;
+  color: #991b1b;
+  padding: 8px 16px;
+  border-bottom: 1px solid #fecaca;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.error-banner button {
+  background: none;
+  border: 1px solid #991b1b;
+  color: #991b1b;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
 /* ── Scrollbar ───────────────────────────────────────────────────── */
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }

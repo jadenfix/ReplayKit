@@ -59,8 +59,8 @@ describe('MockProvider', () => {
   it('returns diff summary', async () => {
     const diff = await provider.getDiffSummary('run_01', 'run_02');
     expect(diff).not.toBeNull();
-    expect(diff!.status_change.from).toBe('Failed');
-    expect(diff!.status_change.to).toBe('Completed');
+    expect(diff!.status_change!.from).toBe('Failed');
+    expect(diff!.status_change!.to).toBe('Completed');
     expect(diff!.changed_span_count).toBe(5);
   });
 

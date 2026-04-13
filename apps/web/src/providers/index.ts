@@ -73,6 +73,7 @@ type ApiArtifactPreview = {
 type ApiArtifactContent = {
   artifact_id: string;
   content: string;
+  content_encoding?: string;
 };
 
 type ApiDependency = {
@@ -353,7 +354,8 @@ export class LiveProvider implements ReplayKitProvider {
         return await this.fetch<ApiArtifactContent>(
           `/api/v1/runs/${runId}/artifacts/${preview.artifact_id}/content`,
         );
-      } catch {
+      } catch (err) {
+        console.warn(`Failed to fetch artifact ${preview.artifact_id} content:`, err);
         return null;
       }
     }));
@@ -366,7 +368,7 @@ export class LiveProvider implements ReplayKitProvider {
       mime: preview.mime,
       byte_len: preview.byte_len,
       summary: summarizeDocument(preview.summary),
-      content: contents[index]?.content ?? summarizeDocument(preview.summary) ?? '',
+      content: decodeArtifactContent(contents[index]) ?? summarizeDocument(preview.summary) ?? '',
     }));
   }
 
@@ -411,10 +413,12 @@ export class LiveProvider implements ReplayKitProvider {
       diff_id: diff.diff_id,
       source_run_id: diff.source_run_id,
       target_run_id: diff.target_run_id,
-      first_divergent_span_id: diff.first_divergent_span_id ?? '',
-      status_change: { from: diff.source_status, to: diff.target_status },
-      latency_ms_delta: diff.latency_ms_delta ?? readInt(diff.summary, 'latency_ms_delta'),
-      token_delta: diff.token_delta ?? readInt(diff.summary, 'token_delta'),
+      first_divergent_span_id: diff.first_divergent_span_id ?? null,
+      status_change: diff.source_status !== diff.target_status
+        ? { from: diff.source_status, to: diff.target_status }
+        : null,
+      latency_ms_delta: diff.latency_ms_delta ?? readIntOrNull(diff.summary, 'latency_ms_delta'),
+      token_delta: diff.token_delta ?? readIntOrNull(diff.summary, 'token_delta'),
       changed_span_count: diff.changed_span_count,
       changed_artifact_count: diff.changed_artifact_count,
       final_output_changed: diff.final_output_changed ?? readBool(diff.summary, 'final_output_changed'),
@@ -636,14 +640,26 @@ function summarizeDocument(summary: Record<string, unknown> | null | undefined):
   return JSON.stringify(summary, null, 2);
 }
 
-function readInt(summary: Record<string, unknown>, key: string): number {
+function readIntOrNull(summary: Record<string, unknown>, key: string): number | null {
   const value = summary[key];
-  return typeof value === 'number' ? value : 0;
+  return typeof value === 'number' ? value : null;
 }
 
 function readBool(summary: Record<string, unknown>, key: string): boolean {
   const value = summary[key];
   return typeof value === 'boolean' ? value : false;
+}
+
+function decodeArtifactContent(raw: ApiArtifactContent | null): string | null {
+  if (!raw) return null;
+  if (raw.content_encoding === 'base64') {
+    try {
+      return atob(raw.content);
+    } catch {
+      return raw.content;
+    }
+  }
+  return raw.content;
 }
 
 // ── Factory ─────────────────────────────────────────────────────────
