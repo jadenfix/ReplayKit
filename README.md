@@ -1,59 +1,125 @@
 # ReplayKit
 
-ReplayKit is a local-first semantic replay debugger for agents.
+ReplayKit is a local-first replay debugger for AI agent runs.
+Record an execution, inspect the span tree, fork from any step,
+patch one input or output, replay only affected downstream work,
+and diff the result against the original.
 
-The project is intentionally documented from the top down before implementation so the system can be built with a stable mental model and a clear product wedge.
+## Prerequisites
 
-## Documents
+- **Rust nightly** (edition 2024): `rustup default nightly`
+- **Node.js >= 20** (for the web app)
+- **Docker** (optional, for the containerized stack)
 
-- [architecture.md](./architecture.md) is the main system design document. It is the deepest technical reference and explains how every subsystem fits together.
-- [product.md](./product.md) defines the product thesis, positioning, user value, and differentiators.
-- [replay-semantics.md](./replay-semantics.md) focuses on replay behavior, branching, invalidation, and patch semantics.
-- [delivery-plan.md](./delivery-plan.md) breaks the work into milestones, streams, acceptance criteria, and verification stages.
+## Quick Start: Local Development
 
-## Product Summary
-
-ReplayKit should let a user:
-
-1. record a local agent run
-2. inspect the execution graph
-3. replay the run from recorded artifacts
-4. fork the run from any supported step
-5. patch one input, output, or environment value
-6. re-execute only affected downstream work
-7. diff the new result against the original
-
-The product is not trying to replace workflow orchestration systems or deterministic process replay systems.
-It is trying to become the best local debugger for agent behavior.
-
-## Current Runtime
-
-The repo now has two storage backends:
-
-- `InMemoryStorage` for fast tests and demos
-- `SqliteStorage` for durable local metadata persistence
-
-The CLI chooses the backend through environment variables:
-
-- `REPLAYKIT_STORAGE=memory` uses the in-memory backend
-- `REPLAYKIT_STORAGE=sqlite` uses SQLite
-- `REPLAYKIT_DATA_ROOT=/path/to/data` sets the data directory (contains `replaykit.db` and the blob store)
-
-Example:
+Build the workspace:
 
 ```bash
-REPLAYKIT_STORAGE=sqlite \
-REPLAYKIT_DATA_ROOT=./data/replaykit \
-cargo run -p replaykit-cli -- demo-branch
+cargo build --workspace
 ```
 
-## Docker
-
-The first Dockerized persistence setup uses SQLite on a Docker volume rather than a networked database.
-That keeps the backend aligned with the local-first architecture while giving the project a real durable store.
-
-Run the demo against the Docker volume:
+Start the **collector** (write endpoint, port 4100):
 
 ```bash
-docker compose run --rm replaykit
+REPLAYKIT_DATA_ROOT=./data cargo run --bin replaykit-collector
 ```
+
+Start the **API server** (read endpoint, port 3210) in a second terminal:
+
+```bash
+cargo run --bin replaykit -- --storage sqlite --data-root ./data serve
+```
+
+Start the **web app** in a third terminal:
+
+```bash
+cd apps/web && npm install && npm run dev
+```
+
+Open `http://localhost:5173/?api=http://localhost:3210` to connect the UI to the live API.
+
+### Seed Demo Data
+
+```bash
+cargo run --bin replaykit -- --storage sqlite --data-root ./data demo
+```
+
+Or seed a run with a branch:
+
+```bash
+cargo run --bin replaykit -- --storage sqlite --data-root ./data demo-branch
+```
+
+## Docker Quick Start
+
+The compose file starts the collector and API as separate services sharing a persistent volume:
+
+```bash
+docker compose up --build
+```
+
+- Collector: `http://localhost:4100`
+- API: `http://localhost:3210`
+
+## Storage Layout
+
+Both collector and API share a data root directory:
+
+```
+{data-root}/
+  replaykit.db              # SQLite database (runs, spans, artifacts, branches)
+  blobs/
+    .tmp/                   # Atomic write staging
+    sha256/
+      {aa}/{bb}/{hash}.blob # Content-addressed artifact blobs
+```
+
+The collector defaults to `REPLAYKIT_DATA_ROOT=./data`.
+The CLI defaults to `--data-root data/replaykit` — pass `--data-root ./data` explicitly to share the same store as the collector.
+
+## Testing
+
+```bash
+# Rust
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# Web
+cd apps/web && npm ci && npm test && npm run build
+
+# Smoke test (starts services, seeds data, verifies end-to-end)
+bash scripts/smoke-test.sh
+```
+
+## Architecture Documentation
+
+- [architecture.md](./agent-instructions/architecture.md) — system design and subsystem reference
+- [product.md](./agent-instructions/product.md) — product thesis and positioning
+- [replay-semantics.md](./agent-instructions/replay-semantics.md) — replay, branching, and patch semantics
+- [delivery-plan.md](./agent-instructions/delivery-plan.md) — milestones and acceptance criteria
+
+## Project Structure
+
+```
+crates/
+  core-model/          # Domain types: RunRecord, SpanRecord, Value, etc.
+  storage/             # Storage trait, SQLite impl, content-addressed blob store
+  collector/           # Write path: ingest runs/spans/artifacts via HTTP (port 4100)
+  api/                 # Read path: query runs/spans/diffs/branches via HTTP (port 3210)
+  cli/                 # CLI binary: serve, demo, runs, replay commands
+  replay-engine/       # Fork, branch, dirty-set computation, replay execution
+  diff-engine/         # Run-to-run diff computation
+  sdk-rust-tracing/    # Rust tracing SDK for recording agent runs
+apps/
+  web/                 # React/Vite frontend
+examples/
+  coding-agent/        # Example agent integration
+fixtures/
+  golden-runs/         # Test fixtures
+```
+
+## License
+
+MIT
