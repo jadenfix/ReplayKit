@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use serde::Serialize;
 
 use replaykit_core_model::{ArtifactId, BranchRequest, PatchManifest, RunId, SpanId, Value};
 use replaykit_replay_engine::ExecutorRegistry;
@@ -96,6 +97,7 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
     service: Arc<ReplayKitService<S, E>>,
 ) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
         // Query endpoints
         .route("/api/v1/runs", get(list_runs::<S, E>))
         .route("/api/v1/runs/{run_id}", get(get_run::<S, E>))
@@ -139,6 +141,15 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route("/api/v1/branches/plan", post(plan_branch::<S, E>))
         .route("/api/v1/diffs", post(compute_diff::<S, E>))
         .with_state(service)
+}
+
+#[derive(Debug, Serialize)]
+struct HealthView {
+    status: &'static str,
+}
+
+async fn healthz() -> Json<HealthView> {
+    Json(HealthView { status: "ok" })
 }
 
 // ---------------------------------------------------------------------------

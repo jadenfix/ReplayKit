@@ -7,8 +7,8 @@ and diff the result against the original.
 
 ## Prerequisites
 
-- **Rust nightly** (edition 2024): `rustup default nightly`
-- **Node.js >= 20** (for the web app)
+- **Rust stable** with `rustfmt` and `clippy`
+- **Node.js 22** recommended for the web app
 - **Docker** (optional, for the containerized stack)
 
 ## Quick Start: Local Development
@@ -34,7 +34,7 @@ cargo run --bin replaykit -- --storage sqlite --data-root ./data serve
 Start the **web app** in a third terminal:
 
 ```bash
-cd apps/web && npm install && npm run dev
+cd apps/web && npm install --cache .npm-cache && npm run dev
 ```
 
 Open `http://localhost:5173/?api=http://localhost:3210` to connect the UI to the live API.
@@ -87,7 +87,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # Web
-cd apps/web && npm ci && npm test && npm run build
+cd apps/web && npm ci --cache .npm-cache && npm run lint && npm test && npm run build
 
 # Smoke test (starts services, seeds data, verifies end-to-end)
 bash scripts/smoke-test.sh

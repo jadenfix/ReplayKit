@@ -6,7 +6,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use replaykit_core_model::{
     ArtifactType, CostMetrics, Document, EdgeKind, HostMetadata, ReplayPolicy, RunId, RunStatus,
@@ -508,6 +508,7 @@ pub fn build_router(collector: Collector<SqliteStorage>) -> Router {
     let state: AppState = Arc::new(CollectorServer { collector });
 
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/v1/runs", post(begin_run))
         .route("/v1/runs/{run_id}/spans", post(start_span))
         .route("/v1/runs/{run_id}/spans/{span_id}/end", post(end_span))
@@ -519,6 +520,10 @@ pub fn build_router(collector: Collector<SqliteStorage>) -> Router {
         .route("/v1/runs/{run_id}/finish", post(finish_run))
         .route("/v1/runs/{run_id}/abort", post(abort_run))
         .with_state(state)
+}
+
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
 /// Start the collector HTTP server.
@@ -574,6 +579,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{self, Request};
+    use axum::response::Response;
     use tower::ServiceExt;
 
     fn setup_test_app() -> (Router, tempfile::TempDir) {
@@ -604,6 +610,30 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         (status, json)
+    }
+
+    async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+
+        let response: Response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_ok() {
+        let (app, _tmp) = setup_test_app();
+        let (status, body) = get_json(&app, "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
     }
 
     #[tokio::test]

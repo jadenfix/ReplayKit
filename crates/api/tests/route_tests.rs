@@ -421,6 +421,15 @@ async fn list_runs_returns_200_with_array() {
 }
 
 #[tokio::test]
+async fn healthz_returns_200() {
+    let (server, _) = seeded_server();
+    let resp = server.get("/healthz").await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
 async fn get_run_returns_200() {
     let (server, run_id) = seeded_server();
     let resp = server.get(&format!("/api/v1/runs/{}", run_id.0)).await;
