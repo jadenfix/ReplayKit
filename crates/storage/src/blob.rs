@@ -31,6 +31,12 @@ pub trait BlobStore: Send + Sync {
     fn exists(&self, blob_ref: &BlobRef) -> Result<bool, StorageError>;
     fn verify(&self, blob_ref: &BlobRef) -> Result<BlobIntegrity, StorageError>;
     fn blob_path(&self, blob_ref: &BlobRef) -> PathBuf;
+
+    /// Remove a blob. Returns `Ok(true)` if a blob was removed, `Ok(false)` if
+    /// it did not exist. Callers must only invoke this once they have confirmed
+    /// no remaining metadata still references the blob — blobs are
+    /// content-addressed and shared.
+    fn remove(&self, blob_ref: &BlobRef) -> Result<bool, StorageError>;
 }
 
 /// Compute SHA-256 hex digest for the given bytes.
@@ -224,6 +230,18 @@ impl BlobStore for LocalBlobStore {
     fn blob_path(&self, blob_ref: &BlobRef) -> PathBuf {
         self.fanout_path(&blob_ref.sha256)
     }
+
+    fn remove(&self, blob_ref: &BlobRef) -> Result<bool, StorageError> {
+        let path = self.fanout_path(&blob_ref.sha256);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(StorageError::Internal(format!(
+                "failed to remove blob {}: {err}",
+                path.display()
+            ))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +323,14 @@ impl BlobStore for InMemoryBlobStore {
 
     fn blob_path(&self, blob_ref: &BlobRef) -> PathBuf {
         PathBuf::from(format!("memory://blob/{}", blob_ref.sha256))
+    }
+
+    fn remove(&self, blob_ref: &BlobRef) -> Result<bool, StorageError> {
+        let mut blobs = self
+            .blobs
+            .write()
+            .map_err(|_| StorageError::Internal("failed to lock in-memory blob store".into()))?;
+        Ok(blobs.remove(&blob_ref.sha256).is_some())
     }
 }
 

@@ -52,54 +52,8 @@ echo "Collector ready."
 # ── Seed data via collector HTTP API ─────────────────────────────────
 echo ""
 echo "--- Seeding data via collector ---"
-
-# Begin a run
-RUN_RESPONSE=$(curl -sf -X POST "http://127.0.0.1:${COLLECTOR_PORT}/v1/runs" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "smoke test run",
-    "entrypoint": "smoke.main",
-    "adapter_name": "smoke",
-    "adapter_version": "0.1.0",
-    "started_at": 1000
-  }')
-RUN_ID=$(echo "$RUN_RESPONSE" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')
-echo "Created run: $RUN_ID"
-
-# Start a span
-SPAN_RESPONSE=$(curl -sf -X POST "http://127.0.0.1:${COLLECTOR_PORT}/v1/runs/${RUN_ID}/spans" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "kind": "ToolCall",
-    "name": "smoke-tool",
-    "started_at": 1001
-  }')
-SPAN_ID=$(echo "$SPAN_RESPONSE" | sed -n 's/.*"span_id":"\([^"]*\)".*/\1/p')
-echo "Created span: $SPAN_ID"
-
-# Add artifact (base64 of "smoke test artifact")
-curl -sf -X POST "http://127.0.0.1:${COLLECTOR_PORT}/v1/runs/${RUN_ID}/artifacts" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"artifact_type\": \"ToolOutput\",
-    \"mime\": \"text/plain\",
-    \"created_at\": 1002,
-    \"span_id\": \"${SPAN_ID}\",
-    \"content_base64\": \"c21va2UgdGVzdCBhcnRpZmFjdA==\"
-  }" > /dev/null
-echo "Added artifact."
-
-# End span
-curl -sf -X POST "http://127.0.0.1:${COLLECTOR_PORT}/v1/runs/${RUN_ID}/spans/${SPAN_ID}/end" \
-  -H "Content-Type: application/json" \
-  -d '{"ended_at": 1003, "status": "Completed"}' > /dev/null
-echo "Ended span."
-
-# Finish run
-curl -sf -X POST "http://127.0.0.1:${COLLECTOR_PORT}/v1/runs/${RUN_ID}/finish" \
-  -H "Content-Type: application/json" \
-  -d '{"ended_at": 1004, "status": "Completed"}' > /dev/null
-echo "Finished run."
+RUN_ID=$(REPLAYKIT_COLLECTOR_URL="http://127.0.0.1:${COLLECTOR_PORT}" \
+  bash scripts/seed-stack-run.sh)
 
 # ── Start API server ─────────────────────────────────────────────────
 echo ""

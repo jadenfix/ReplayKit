@@ -303,6 +303,7 @@ pub struct ArtifactPreviewView {
     pub artifact_type_label: &'static str,
     pub mime: String,
     pub byte_len: usize,
+    pub sha256: String,
     pub summary: Document,
     pub created_at: u64,
 }
@@ -315,6 +316,7 @@ impl ArtifactPreviewView {
             artifact_type_label: artifact_type_label(a.artifact_type),
             mime: a.mime.clone(),
             byte_len: a.byte_len,
+            sha256: a.sha256.clone(),
             summary: a.summary.clone(),
             created_at: a.created_at,
         }
