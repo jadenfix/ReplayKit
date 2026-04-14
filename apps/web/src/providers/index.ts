@@ -368,7 +368,8 @@ export class LiveProvider implements ReplayKitProvider {
       mime: preview.mime,
       byte_len: preview.byte_len,
       summary: summarizeDocument(preview.summary),
-      content: decodeArtifactContent(contents[index]) ?? summarizeDocument(preview.summary) ?? '',
+      content: contents[index]?.content ?? summarizeDocument(preview.summary) ?? '',
+      content_encoding: normalizeContentEncoding(contents[index]?.content_encoding),
     }));
   }
 
@@ -650,16 +651,9 @@ function readBool(summary: Record<string, unknown>, key: string): boolean {
   return typeof value === 'boolean' ? value : false;
 }
 
-function decodeArtifactContent(raw: ApiArtifactContent | null): string | null {
-  if (!raw) return null;
-  if (raw.content_encoding === 'base64') {
-    try {
-      return atob(raw.content);
-    } catch {
-      return raw.content;
-    }
-  }
-  return raw.content;
+function normalizeContentEncoding(raw: string | undefined): 'utf-8' | 'base64' | undefined {
+  if (raw === 'utf-8' || raw === 'base64') return raw;
+  return undefined;
 }
 
 // ── Factory ─────────────────────────────────────────────────────────

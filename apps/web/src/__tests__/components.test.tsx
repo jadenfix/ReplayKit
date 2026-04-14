@@ -173,6 +173,30 @@ describe('ArtifactViewer', () => {
     render(<ArtifactViewer artifacts={artifacts} selectedSpanId="s01_shell1" />);
     expect(screen.getByText(/cargo test auth/)).toBeInTheDocument();
   });
+
+  it('renders image artifacts from base64 content without decoding them to text', () => {
+    render(
+      <ArtifactViewer
+        artifacts={[
+          {
+            artifact_id: 'img1',
+            run_id: 'run_01',
+            span_id: 's01_shell1',
+            type: 'screenshot',
+            mime: 'image/png',
+            byte_len: 4,
+            summary: 'png preview',
+            content: 'aGVsbG8=',
+            content_encoding: 'base64',
+          },
+        ]}
+        selectedSpanId="s01_shell1"
+      />,
+    );
+
+    const image = screen.getByRole('img', { name: /screenshot preview/i });
+    expect(image).toHaveAttribute('src', 'data:image/png;base64,aGVsbG8=');
+  });
 });
 
 describe('DiffSummaryPanel', () => {

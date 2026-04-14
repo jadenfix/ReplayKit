@@ -50,6 +50,29 @@ function ArtifactPanel({ artifact }: { artifact: ArtifactRecord }) {
 
 function ArtifactContent({ artifact }: { artifact: ArtifactRecord }) {
   const mime = artifact.mime;
+  const isBase64 = artifact.content_encoding === 'base64';
+
+  if (isBase64 && mime.startsWith('image/')) {
+    return (
+      <div className="artifact-content artifact-content--image">
+        <img
+          alt={`${artifact.type} preview`}
+          src={`data:${mime};base64,${artifact.content}`}
+        />
+      </div>
+    );
+  }
+
+  if (isBase64) {
+    return (
+      <div className="artifact-content artifact-content--binary">
+        <div className="artifact-content__note">
+          Binary artifact encoded as base64 for transport.
+        </div>
+        <pre className="artifact-content artifact-content--text">{artifact.content}</pre>
+      </div>
+    );
+  }
 
   if (mime === 'application/json') {
     return <JsonViewer content={artifact.content} />;
