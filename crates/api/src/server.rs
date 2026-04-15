@@ -3,11 +3,12 @@ use std::sync::Arc;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde::Serialize;
+use tower_http::cors::CorsLayer;
 
 use replaykit_core_model::{ArtifactId, BranchRequest, PatchManifest, RunId, SpanId, Value};
 use replaykit_replay_engine::ExecutorRegistry;
@@ -140,7 +141,20 @@ pub fn build_router<S: Storage + 'static, E: ExecutorRegistry + 'static>(
         .route("/api/v1/branches", post(create_branch::<S, E>))
         .route("/api/v1/branches/plan", post(plan_branch::<S, E>))
         .route("/api/v1/diffs", post(compute_diff::<S, E>))
+        .layer(local_dev_cors())
         .with_state(service)
+}
+
+fn local_dev_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("http://localhost:5173"),
+            HeaderValue::from_static("http://127.0.0.1:5173"),
+            HeaderValue::from_static("http://localhost:4173"),
+            HeaderValue::from_static("http://127.0.0.1:4173"),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::ACCEPT])
 }
 
 #[derive(Debug, Serialize)]
@@ -293,8 +307,17 @@ async fn get_artifact_content<S: Storage + 'static, E: ExecutorRegistry + 'stati
 ) -> Response {
     let run_id = RunId(run_id);
     let artifact_id = ArtifactId(artifact_id);
+    let record = match svc.get_artifact(&run_id, &artifact_id) {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
     match svc.read_artifact_content(&run_id, &artifact_id) {
-        Ok(bytes) => Json(ArtifactContentView::from_bytes(&artifact_id.0, &bytes)).into_response(),
+        Ok(bytes) => Json(ArtifactContentView::from_bytes(
+            &artifact_id.0,
+            &bytes,
+            &record.mime,
+        ))
+        .into_response(),
         Err(e) => err_response(e),
     }
 }

@@ -313,13 +313,35 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
     }
 
     pub fn create_branch(&self, request: BranchRequest) -> Result<BranchExecution, ApiError> {
+        // Atomicity is scoped to ReplayKit-owned persisted state only.
+        // External side effects that happened during fork execution (shell
+        // commands, workspace writes, model calls) are not rolled back.
         let execution = self.replay.execute_fork(request)?;
-        self.diff.diff_runs(
+        let diff_result = self.diff.diff_runs(
             &execution.branch.source_run_id,
             &execution.branch.target_run_id,
             execution.branch.created_at,
-        )?;
-        Ok(execution)
+        );
+        match diff_result {
+            Ok(_) => Ok(execution),
+            Err(diff_err) => {
+                let target_run_id = execution.branch.target_run_id.clone();
+                let branch_id = execution.branch.branch_id.clone();
+                let replay_job_id = execution.replay_job.replay_job_id.clone();
+                match self.storage.cleanup_branch_execution(
+                    &target_run_id,
+                    &branch_id,
+                    &replay_job_id,
+                ) {
+                    Ok(()) => Err(ApiError::from(diff_err)),
+                    Err(cleanup_err) => Err(ApiError::Storage(
+                        replaykit_storage::StorageError::Internal(format!(
+                            "branch diff failed: {diff_err:?}; cleanup also failed: {cleanup_err}"
+                        )),
+                    )),
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -545,10 +567,10 @@ mod tests {
 
     use replaykit_collector::{ArtifactSpec, BeginRun, EndSpan, SpanSpec};
     use replaykit_core_model::{
-        ArtifactId, ArtifactType, BranchId, BranchRequest, BranchRecord, CostMetrics, Document,
-        EventRecord, HostMetadata, IdKind, PatchManifest, PatchType, ReplayJobId,
-        ReplayJobRecord, ReplayPolicy, RunDiffRecord, RunStatus, SnapshotId, SnapshotRecord,
-        SpanEdgeRecord, SpanId, SpanKind, SpanStatus, Value,
+        ArtifactId, ArtifactType, BranchId, BranchRecord, BranchRequest, CostMetrics, Document,
+        EventRecord, HostMetadata, IdKind, PatchManifest, PatchType, ReplayJobId, ReplayJobRecord,
+        ReplayPolicy, RunDiffRecord, RunStatus, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId,
+        SpanKind, SpanStatus, Value,
     };
     use replaykit_replay_engine::{ExecutionResult, ProducedArtifact, ReplayExecutionContext};
     use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage, StorageError};
@@ -710,6 +732,156 @@ mod tests {
         ) -> Result<replaykit_storage::BlobIntegrity, StorageError> {
             self.inner.verify_artifact_integrity(run_id, artifact_id)
         }
+
+        fn cleanup_branch_execution(
+            &self,
+            target_run_id: &RunId,
+            branch_id: &BranchId,
+            replay_job_id: &ReplayJobId,
+        ) -> Result<(), StorageError> {
+            self.inner
+                .cleanup_branch_execution(target_run_id, branch_id, replay_job_id)
+        }
+    }
+
+    /// Wrapper that fails both `insert_diff` and `cleanup_branch_execution`
+    /// so we can prove the combined-error path.
+    struct CleanupFailStorage {
+        inner: InMemoryStorage,
+    }
+
+    impl CleanupFailStorage {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryStorage::new(),
+            }
+        }
+    }
+
+    impl Storage for CleanupFailStorage {
+        fn allocate_id(&self, kind: IdKind) -> Result<String, StorageError> {
+            self.inner.allocate_id(kind)
+        }
+        fn next_sequence(&self, run_id: &RunId) -> Result<u64, StorageError> {
+            self.inner.next_sequence(run_id)
+        }
+        fn insert_run(&self, run: RunRecord) -> Result<(), StorageError> {
+            self.inner.insert_run(run)
+        }
+        fn update_run(&self, run: RunRecord) -> Result<(), StorageError> {
+            self.inner.update_run(run)
+        }
+        fn get_run(&self, run_id: &RunId) -> Result<RunRecord, StorageError> {
+            self.inner.get_run(run_id)
+        }
+        fn list_runs(&self) -> Result<Vec<RunRecord>, StorageError> {
+            self.inner.list_runs()
+        }
+        fn upsert_span(&self, span: SpanRecord) -> Result<(), StorageError> {
+            self.inner.upsert_span(span)
+        }
+        fn get_span(&self, run_id: &RunId, span_id: &SpanId) -> Result<SpanRecord, StorageError> {
+            self.inner.get_span(run_id, span_id)
+        }
+        fn list_spans(&self, run_id: &RunId) -> Result<Vec<SpanRecord>, StorageError> {
+            self.inner.list_spans(run_id)
+        }
+        fn insert_event(&self, event: EventRecord) -> Result<(), StorageError> {
+            self.inner.insert_event(event)
+        }
+        fn list_events(&self, run_id: &RunId) -> Result<Vec<EventRecord>, StorageError> {
+            self.inner.list_events(run_id)
+        }
+        fn insert_artifact(&self, artifact: ArtifactRecord) -> Result<(), StorageError> {
+            self.inner.insert_artifact(artifact)
+        }
+        fn get_artifact(
+            &self,
+            run_id: &RunId,
+            artifact_id: &ArtifactId,
+        ) -> Result<ArtifactRecord, StorageError> {
+            self.inner.get_artifact(run_id, artifact_id)
+        }
+        fn list_artifacts(&self, run_id: &RunId) -> Result<Vec<ArtifactRecord>, StorageError> {
+            self.inner.list_artifacts(run_id)
+        }
+        fn insert_snapshot(&self, snapshot: SnapshotRecord) -> Result<(), StorageError> {
+            self.inner.insert_snapshot(snapshot)
+        }
+        fn get_snapshot(
+            &self,
+            run_id: &RunId,
+            snapshot_id: &SnapshotId,
+        ) -> Result<SnapshotRecord, StorageError> {
+            self.inner.get_snapshot(run_id, snapshot_id)
+        }
+        fn list_snapshots(&self, run_id: &RunId) -> Result<Vec<SnapshotRecord>, StorageError> {
+            self.inner.list_snapshots(run_id)
+        }
+        fn insert_edge(&self, edge: SpanEdgeRecord) -> Result<(), StorageError> {
+            self.inner.insert_edge(edge)
+        }
+        fn list_edges(&self, run_id: &RunId) -> Result<Vec<SpanEdgeRecord>, StorageError> {
+            self.inner.list_edges(run_id)
+        }
+        fn insert_branch(&self, branch: BranchRecord) -> Result<(), StorageError> {
+            self.inner.insert_branch(branch)
+        }
+        fn get_branch(&self, branch_id: &BranchId) -> Result<BranchRecord, StorageError> {
+            self.inner.get_branch(branch_id)
+        }
+        fn list_branches(&self) -> Result<Vec<BranchRecord>, StorageError> {
+            self.inner.list_branches()
+        }
+        fn insert_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
+            self.inner.insert_replay_job(job)
+        }
+        fn update_replay_job(&self, job: ReplayJobRecord) -> Result<(), StorageError> {
+            self.inner.update_replay_job(job)
+        }
+        fn get_replay_job(
+            &self,
+            replay_job_id: &ReplayJobId,
+        ) -> Result<ReplayJobRecord, StorageError> {
+            self.inner.get_replay_job(replay_job_id)
+        }
+        fn insert_diff(&self, _diff: RunDiffRecord) -> Result<(), StorageError> {
+            Err(StorageError::Internal(
+                "synthetic diff storage failure".into(),
+            ))
+        }
+        fn get_diff(&self, source: &RunId, target: &RunId) -> Result<RunDiffRecord, StorageError> {
+            self.inner.get_diff(source, target)
+        }
+        fn store_artifact_with_content(
+            &self,
+            artifact: ArtifactRecord,
+            content: &[u8],
+        ) -> Result<ArtifactRecord, StorageError> {
+            self.inner.store_artifact_with_content(artifact, content)
+        }
+        fn read_artifact_content(
+            &self,
+            run_id: &RunId,
+            artifact_id: &ArtifactId,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.inner.read_artifact_content(run_id, artifact_id)
+        }
+        fn verify_artifact_integrity(
+            &self,
+            run_id: &RunId,
+            artifact_id: &ArtifactId,
+        ) -> Result<replaykit_storage::BlobIntegrity, StorageError> {
+            self.inner.verify_artifact_integrity(run_id, artifact_id)
+        }
+        fn cleanup_branch_execution(
+            &self,
+            _target_run_id: &RunId,
+            _branch_id: &BranchId,
+            _replay_job_id: &ReplayJobId,
+        ) -> Result<(), StorageError> {
+            Err(StorageError::Internal("synthetic cleanup failure".into()))
+        }
     }
 
     use super::*;
@@ -793,10 +965,16 @@ mod tests {
     }
 
     #[test]
-    fn create_branch_fails_if_diff_cannot_be_persisted() {
+    fn create_branch_fails_and_cleans_up_if_diff_cannot_be_persisted() {
         let storage = Arc::new(DiffFailStorage::new());
         let service = ReplayKitService::new(storage.clone(), FakeExecutorRegistry);
         let run = seed_run(&service);
+
+        // Snapshot the source-run state so we can prove only the target-side
+        // state was removed.
+        let source_artifacts_before = storage.list_artifacts(&run.run_id).unwrap();
+        let runs_before = storage.list_runs().unwrap().len();
+        let branches_before = storage.list_branches().unwrap().len();
 
         let err = service
             .create_branch(BranchRequest {
@@ -819,7 +997,55 @@ mod tests {
             ))) => {
                 assert!(message.contains("synthetic diff storage failure"));
             }
-            other => panic!("expected storage error, got {other:?}"),
+            other => panic!("expected diff storage error, got {other:?}"),
+        }
+
+        // No new runs/branches remain after cleanup — the single pre-existing
+        // source run is the only one left.
+        assert_eq!(storage.list_runs().unwrap().len(), runs_before);
+        assert_eq!(storage.list_branches().unwrap().len(), branches_before);
+        // Source-run artifacts untouched.
+        let source_artifacts_after = storage.list_artifacts(&run.run_id).unwrap();
+        assert_eq!(source_artifacts_after.len(), source_artifacts_before.len());
+    }
+
+    #[test]
+    fn create_branch_returns_combined_error_when_cleanup_also_fails() {
+        let storage = Arc::new(CleanupFailStorage::new());
+        let service = ReplayKitService::new(storage.clone(), FakeExecutorRegistry);
+        let run = seed_run(&service);
+
+        let err = service
+            .create_branch(BranchRequest {
+                source_run_id: run.run_id.clone(),
+                fork_span_id: SpanId("tool".into()),
+                patch_manifest: PatchManifest {
+                    patch_type: PatchType::ToolOutputOverride,
+                    target_artifact_id: None,
+                    replacement: Value::Text("patched tool result".into()),
+                    note: None,
+                    created_at: 20,
+                },
+                created_by: Some("test".into()),
+            })
+            .unwrap_err();
+
+        match err {
+            ApiError::Storage(StorageError::Internal(message)) => {
+                assert!(
+                    message.contains("branch diff failed"),
+                    "combined error must mention diff failure: {message}"
+                );
+                assert!(
+                    message.contains("cleanup also failed"),
+                    "combined error must mention cleanup failure: {message}"
+                );
+                assert!(
+                    message.contains("synthetic cleanup failure"),
+                    "combined error must propagate cleanup cause: {message}"
+                );
+            }
+            other => panic!("expected combined Internal error, got {other:?}"),
         }
     }
 

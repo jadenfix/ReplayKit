@@ -4,3 +4,7 @@ data/
 node_modules/
 .env*
 *.db
+apps/web/.npm-cache/
+apps/web/dist/
+apps/web/test-results/
+apps/web/playwright-report/

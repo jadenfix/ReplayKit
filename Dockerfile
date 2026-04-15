@@ -14,6 +14,10 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/target/release/replaykit /usr/local/bin/replaykit
 COPY --from=build /app/target/release/replaykit-collector /usr/local/bin/replaykit-collector
 

@@ -53,7 +53,7 @@ cargo run --bin replaykit -- --storage sqlite --data-root ./data demo-branch
 
 ## Docker Quick Start
 
-The compose file starts the collector and API as separate services sharing a persistent volume:
+The compose file starts the collector, API, and web app as separate services sharing a persistent volume:
 
 ```bash
 docker compose up --build
@@ -61,6 +61,13 @@ docker compose up --build
 
 - Collector: `http://localhost:4100`
 - API: `http://localhost:3210`
+- Web: `http://localhost:5173`
+
+Seed one real run into the running stack:
+
+```bash
+bash scripts/seed-stack-run.sh
+```
 
 ## Storage Layout
 
@@ -88,6 +95,9 @@ cargo test --workspace
 
 # Web
 cd apps/web && npm ci --cache .npm-cache && npm run lint && npm test && npm run build
+
+# Browser smoke prerequisites
+cd apps/web && npx playwright install chromium
 
 # Smoke test (starts services, seeds data, verifies end-to-end)
 bash scripts/smoke-test.sh
