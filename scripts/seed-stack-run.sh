@@ -24,7 +24,7 @@ log "--- Seeding run via collector at ${COLLECTOR_BASE_URL} ---"
 run_response=$(curl -sf -X POST "${COLLECTOR_BASE_URL}/v1/runs" \
   -H "Content-Type: application/json" \
   -d "${begin_run_payload}")
-run_id=$(printf '%s' "${run_response}" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')
+run_id=$(printf '%s' "${run_response}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')
 if [ -z "${run_id}" ]; then
   log "Failed to parse run_id from collector response: ${run_response}"
   exit 1
@@ -38,7 +38,7 @@ span_response=$(curl -sf -X POST "${COLLECTOR_BASE_URL}/v1/runs/${run_id}/spans"
     \"name\": \"smoke-tool\",
     \"started_at\": $((STARTED_AT + 1))
   }")
-span_id=$(printf '%s' "${span_response}" | sed -n 's/.*"span_id":"\([^"]*\)".*/\1/p')
+span_id=$(printf '%s' "${span_response}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["span_id"])')
 if [ -z "${span_id}" ]; then
   log "Failed to parse span_id from collector response: ${span_response}"
   exit 1
