@@ -331,23 +331,55 @@ pub struct ArtifactContentView {
 }
 
 impl ArtifactContentView {
-    pub fn from_bytes(artifact_id: &str, bytes: &[u8]) -> Self {
-        match std::str::from_utf8(bytes) {
-            Ok(text) => Self {
+    pub fn from_bytes(artifact_id: &str, bytes: &[u8], mime: &str) -> Self {
+        if is_text_mime(mime)
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            return Self {
                 artifact_id: artifact_id.to_owned(),
                 content: text.to_owned(),
                 content_encoding: "utf-8",
-            },
-            Err(_) => {
-                use base64::Engine;
-                Self {
-                    artifact_id: artifact_id.to_owned(),
-                    content: base64::engine::general_purpose::STANDARD.encode(bytes),
-                    content_encoding: "base64",
-                }
-            }
+            };
+        }
+        use base64::Engine;
+        Self {
+            artifact_id: artifact_id.to_owned(),
+            content: base64::engine::general_purpose::STANDARD.encode(bytes),
+            content_encoding: "base64",
         }
     }
+}
+
+fn is_text_mime(mime: &str) -> bool {
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    if normalized.starts_with("text/") {
+        return true;
+    }
+    matches!(
+        normalized.as_str(),
+        "application/json"
+            | "application/ld+json"
+            | "application/problem+json"
+            | "application/manifest+json"
+            | "application/xml"
+            | "application/xhtml+xml"
+            | "application/javascript"
+            | "application/ecmascript"
+            | "application/x-ndjson"
+            | "application/yaml"
+            | "application/x-yaml"
+            | "application/toml"
+            | "application/graphql"
+            | "application/sql"
+            | "application/x-sh"
+    ) || (normalized.starts_with("application/") && normalized.ends_with("+json"))
+        || (normalized.starts_with("application/") && normalized.ends_with("+xml"))
+        || (normalized.starts_with("application/") && normalized.ends_with("+yaml"))
 }
 
 // ---------------------------------------------------------------------------

@@ -701,6 +701,49 @@ async fn artifact_content_binary_round_trips_via_base64() {
 }
 
 #[tokio::test]
+async fn artifact_content_forces_base64_for_binary_mime_even_if_utf8_valid() {
+    // Regression: UTF-8 validity alone must not decide encoding. Bytes that
+    // happen to be valid UTF-8 (e.g. pure ASCII) under a binary mime like
+    // application/octet-stream must still come back base64, so the web
+    // ArtifactViewer routes them through the binary metadata + download UX
+    // instead of dumping them as text.
+    let (server, run_id, storage) = seeded_server_with_storage();
+    let ascii_bytes: &[u8] = b"\x00\x01\x02\x03hello world"; // valid UTF-8
+    assert!(std::str::from_utf8(ascii_bytes).is_ok());
+    let artifact = replaykit_core_model::ArtifactRecord {
+        artifact_id: replaykit_core_model::ArtifactId("octet-ascii".into()),
+        run_id: run_id.clone(),
+        span_id: None,
+        artifact_type: ArtifactType::ToolOutput,
+        mime: "application/octet-stream".into(),
+        sha256: "placeholder".into(),
+        byte_len: 0,
+        blob_path: "memory://placeholder".into(),
+        summary: Document::new(),
+        redaction: Document::new(),
+        created_at: 11,
+    };
+    storage
+        .store_artifact_with_content(artifact, ascii_bytes)
+        .unwrap();
+
+    let resp = server
+        .get(&format!(
+            "/api/v1/runs/{}/artifacts/{}/content",
+            run_id.0, "octet-ascii"
+        ))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["content_encoding"], "base64");
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, ascii_bytes);
+}
+
+#[tokio::test]
 async fn cached_diff_returns_404_when_not_computed() {
     let (server, run_id) = seeded_server();
     let resp = server

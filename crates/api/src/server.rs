@@ -307,8 +307,17 @@ async fn get_artifact_content<S: Storage + 'static, E: ExecutorRegistry + 'stati
 ) -> Response {
     let run_id = RunId(run_id);
     let artifact_id = ArtifactId(artifact_id);
+    let record = match svc.get_artifact(&run_id, &artifact_id) {
+        Ok(r) => r,
+        Err(e) => return err_response(e),
+    };
     match svc.read_artifact_content(&run_id, &artifact_id) {
-        Ok(bytes) => Json(ArtifactContentView::from_bytes(&artifact_id.0, &bytes)).into_response(),
+        Ok(bytes) => Json(ArtifactContentView::from_bytes(
+            &artifact_id.0,
+            &bytes,
+            &record.mime,
+        ))
+        .into_response(),
         Err(e) => err_response(e),
     }
 }
