@@ -123,3 +123,10 @@ fixtures/
 ## License
 
 MIT
+
+## Ecosystem
+
+ReplayKit is part of the [ecosystem](https://github.com/jadenfix/ecosystem) — a family of Rust-first, local-first agent-infrastructure projects. It is fully standalone: its collector, API, and web UI cover the whole record → fork → patch → replay → diff loop for any agent run. Within the family it can connect for:
+
+- acting as the deep-replay specialist next to [beater](https://github.com/jadenfix/beater)'s observe/eval/gate platform, over a shared canonical span format (roadmap)
+- replaying and diffing [tempo](https://github.com/jadenfix/tempo) state-forked browsing sessions and [beater.js](https://github.com/jadenfix/beater.js) journaled runs
