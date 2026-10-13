@@ -99,8 +99,13 @@ cd apps/web && npm ci --cache .npm-cache && npm run lint && npm test && npm run 
 # Browser smoke prerequisites
 cd apps/web && npx playwright install chromium
 
-# Smoke test (starts services, seeds data, verifies end-to-end)
+# Backend smoke (starts real binaries, checks storage and restart persistence)
 bash scripts/smoke-test.sh
+
+# Native full stack: collector + SQLite + API + CLI fork/diff + live browser
+# Install the web dependencies and Playwright Chromium first:
+# cd apps/web && npm ci && npx playwright install chromium && cd ../..
+python3 scripts/native-stack-gate.py
 ```
 
 ## Architecture Documentation
@@ -133,3 +138,11 @@ fixtures/
 ## License
 
 MIT
+
+The native stack gate uses frontend port 5173 because the API deliberately
+allows the documented local development origins. It fails if that port is busy.
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE=/path/to/chromium` can select an existing browser.
+Backend ports are selected dynamically, and `CARGO_TARGET_DIR` is respected.
+The CLI demo fork intentionally retains its recorded failed LLM span; the gate
+checks the real tool-output change and cached diff without claiming live-model
+execution.

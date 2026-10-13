@@ -38,3 +38,6 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      - name: Native collector and storage smoke
+        run: bash scripts/smoke-test.sh
