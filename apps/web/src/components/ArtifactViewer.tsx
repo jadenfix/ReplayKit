@@ -1,4 +1,10 @@
+import { useState } from 'react';
 import type { ArtifactRecord } from '../types';
+import {
+  downloadBinaryArtifact,
+  formatByteLen,
+  suggestFilename,
+} from '../utils/binary';
 
 interface ArtifactViewerProps {
   artifacts: ArtifactRecord[];
@@ -64,14 +70,7 @@ function ArtifactContent({ artifact }: { artifact: ArtifactRecord }) {
   }
 
   if (isBase64) {
-    return (
-      <div className="artifact-content artifact-content--binary">
-        <div className="artifact-content__note">
-          Binary artifact encoded as base64 for transport.
-        </div>
-        <pre className="artifact-content artifact-content--text">{artifact.content}</pre>
-      </div>
-    );
+    return <BinaryArtifactView artifact={artifact} />;
   }
 
   if (mime === 'application/json') {
@@ -125,6 +124,51 @@ function ShellLogViewer({ content }: { content: string }) {
         return <span key={i} className={cls}>{line}{'\n'}</span>;
       })}
     </pre>
+  );
+}
+
+function BinaryArtifactView({ artifact }: { artifact: ArtifactRecord }) {
+  const [showRaw, setShowRaw] = useState(false);
+  const sizeLabel = formatByteLen(artifact.byte_len);
+  const filename = suggestFilename(artifact);
+
+  return (
+    <div className="artifact-content artifact-content--binary" data-testid="artifact-binary">
+      <dl className="artifact-content__metadata">
+        <dt>MIME</dt>
+        <dd>{artifact.mime || 'application/octet-stream'}</dd>
+        <dt>Size</dt>
+        <dd>{sizeLabel}</dd>
+        {artifact.sha256 && (
+          <>
+            <dt>SHA-256</dt>
+            <dd className="artifact-content__hash">{artifact.sha256}</dd>
+          </>
+        )}
+        <dt>Encoding</dt>
+        <dd>base64 (transport)</dd>
+      </dl>
+      <div className="artifact-content__actions">
+        <button
+          type="button"
+          className="artifact-content__download"
+          onClick={() => downloadBinaryArtifact(artifact)}
+          data-testid="artifact-download"
+        >
+          Download {filename}
+        </button>
+        <button
+          type="button"
+          className="artifact-content__toggle-raw"
+          onClick={() => setShowRaw(v => !v)}
+        >
+          {showRaw ? 'Hide raw base64' : 'Show raw base64'}
+        </button>
+      </div>
+      {showRaw && (
+        <pre className="artifact-content artifact-content--text">{artifact.content}</pre>
+      )}
+    </div>
   );
 }
 

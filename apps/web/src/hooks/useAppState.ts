@@ -28,6 +28,15 @@ type Action =
   | { type: 'FORENSICS_LOADED'; runId: string; forensics: ForensicsReport | null }
   | { type: 'SET_ERROR'; error: string | null };
 
+const RUNS_RETRY_DELAYS_MS = [500, 1000];
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error && err.message.trim()) {
+    return err.message;
+  }
+  return fallback;
+}
+
 // ── Initial state ───────────────────────────────────────────────────
 
 const INIT: AppState = {
@@ -159,14 +168,39 @@ export function useAppState(provider: ReplayKitProvider) {
 
   // Load runs on mount
   useEffect(() => {
+    let cancelled = false;
+    let retryTimer: number | null = null;
+
+    const loadRuns = async (attempt: number) => {
+      try {
+        const runs = await provider.listRuns();
+        if (cancelled) return;
+        dispatch({ type: 'SET_ERROR', error: null });
+        dispatch({ type: 'RUNS_LOADED', runs });
+      } catch (err) {
+        if (cancelled) return;
+        if (attempt < RUNS_RETRY_DELAYS_MS.length) {
+          retryTimer = window.setTimeout(() => {
+            void loadRuns(attempt + 1);
+          }, RUNS_RETRY_DELAYS_MS[attempt]);
+          return;
+        }
+        console.error('Failed to load runs:', err);
+        dispatch({ type: 'SET_ERROR', error: 'Failed to load runs. Check API connection.' });
+        dispatch({ type: 'RUNS_LOADED', runs: [] });
+      }
+    };
+
+    dispatch({ type: 'SET_ERROR', error: null });
     dispatch({ type: 'RUNS_LOADING' });
-    provider.listRuns().then(runs => {
-      dispatch({ type: 'RUNS_LOADED', runs });
-    }).catch(err => {
-      console.error('Failed to load runs:', err);
-      dispatch({ type: 'SET_ERROR', error: 'Failed to load runs. Check API connection.' });
-      dispatch({ type: 'RUNS_LOADED', runs: [] });
-    });
+    void loadRuns(0);
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
+    };
   }, [provider]);
 
   // Load tree when run selected
@@ -257,8 +291,17 @@ export function useAppState(provider: ReplayKitProvider) {
 
   const submitBranch = useCallback(async () => {
     if (!state.branchDraft) return;
-    const branch = await provider.createBranch(state.branchDraft);
-    dispatch({ type: 'BRANCH_CREATED', branch });
+    try {
+      const branch = await provider.createBranch(state.branchDraft);
+      dispatch({ type: 'SET_ERROR', error: null });
+      dispatch({ type: 'BRANCH_CREATED', branch });
+    } catch (err) {
+      console.error('Failed to create branch:', err);
+      dispatch({
+        type: 'SET_ERROR',
+        error: `Failed to create branch. ${errorMessage(err, 'Unknown error.')}`,
+      });
+    }
   }, [provider, state.branchDraft]);
 
   const loadDiff = useCallback(async (sourceRunId: string, targetRunId: string) => {

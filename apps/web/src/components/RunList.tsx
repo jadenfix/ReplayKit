@@ -12,7 +12,7 @@ interface RunListProps {
 export function RunList({ runs, selectedRunId, loading, onSelectRun }: RunListProps) {
   if (loading) {
     return (
-      <div className="run-list">
+      <div className="run-list" data-testid="run-list">
         <div className="run-list__header">
           <h2>Runs</h2>
         </div>
@@ -22,20 +22,26 @@ export function RunList({ runs, selectedRunId, loading, onSelectRun }: RunListPr
   }
 
   return (
-    <div className="run-list">
+    <div className="run-list" data-testid="run-list">
       <div className="run-list__header">
         <h2>Runs</h2>
         <span className="run-list__count">{runs.length}</span>
       </div>
       <div className="run-list__items">
-        {runs.map(run => (
-          <RunListEntry
-            key={run.run_id}
-            run={run}
-            selected={run.run_id === selectedRunId}
-            onSelect={onSelectRun}
-          />
-        ))}
+        {runs.length === 0 ? (
+          <div className="run-list__empty" data-testid="run-list-empty">
+            No runs captured yet
+          </div>
+        ) : (
+          runs.map(run => (
+            <RunListEntry
+              key={run.run_id}
+              run={run}
+              selected={run.run_id === selectedRunId}
+              onSelect={onSelectRun}
+            />
+          ))
+        )}
       </div>
     </div>
   );

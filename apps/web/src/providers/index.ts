@@ -67,6 +67,7 @@ type ApiArtifactPreview = {
   artifact_type_label: string;
   mime: string;
   byte_len: number;
+  sha256?: string;
   summary: Record<string, unknown>;
 };
 
@@ -367,6 +368,7 @@ export class LiveProvider implements ReplayKitProvider {
       type: preview.artifact_type_label,
       mime: preview.mime,
       byte_len: preview.byte_len,
+      sha256: preview.sha256 ?? null,
       summary: summarizeDocument(preview.summary),
       content: contents[index]?.content ?? summarizeDocument(preview.summary) ?? '',
       content_encoding: normalizeContentEncoding(contents[index]?.content_encoding),
@@ -659,10 +661,12 @@ function normalizeContentEncoding(raw: string | undefined): 'utf-8' | 'base64' |
 // ── Factory ─────────────────────────────────────────────────────────
 
 export function createProvider(): ReplayKitProvider {
-  const apiUrl = (typeof window !== 'undefined')
+  const queryOverride = (typeof window !== 'undefined')
     ? new URLSearchParams(window.location.search).get('api')
     : null;
+  const envDefault = (import.meta.env?.VITE_REPLAYKIT_API_BASE_URL as string | undefined) ?? null;
 
-  if (apiUrl) return new LiveProvider(apiUrl);
+  const resolved = queryOverride ?? envDefault;
+  if (resolved) return new LiveProvider(resolved);
   return new MockProvider();
 }

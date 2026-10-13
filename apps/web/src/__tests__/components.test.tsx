@@ -25,6 +25,12 @@ describe('RunList', () => {
     expect(screen.getByText('Loading runs...')).toBeInTheDocument();
   });
 
+  it('shows explicit empty state when there are no runs', () => {
+    render(<RunList runs={[]} selectedRunId={null} loading={false} onSelectRun={vi.fn()} />);
+    expect(screen.getByTestId('run-list')).toBeInTheDocument();
+    expect(screen.getByTestId('run-list-empty')).toHaveTextContent('No runs captured yet');
+  });
+
   it('calls onSelectRun when clicked', () => {
     const onSelect = vi.fn();
     render(<RunList runs={RUN_LIST} selectedRunId={null} loading={false} onSelectRun={onSelect} />);
@@ -196,6 +202,110 @@ describe('ArtifactViewer', () => {
 
     const image = screen.getByRole('img', { name: /screenshot preview/i });
     expect(image).toHaveAttribute('src', 'data:image/png;base64,aGVsbG8=');
+  });
+
+  it('renders metadata panel and download button for non-image binary artifacts', () => {
+    render(
+      <ArtifactViewer
+        artifacts={[
+          {
+            artifact_id: 'pdf1',
+            run_id: 'run_01',
+            span_id: 's01_shell1',
+            type: 'report',
+            mime: 'application/pdf',
+            byte_len: 2048,
+            summary: 'invoice export',
+            sha256: 'a'.repeat(64),
+            content: 'JVBERi0xLjQKJeLjz9M=',
+            content_encoding: 'base64',
+          },
+        ]}
+        selectedSpanId="s01_shell1"
+      />,
+    );
+
+    const binary = screen.getByTestId('artifact-binary');
+    expect(binary).toBeInTheDocument();
+    expect(binary).toHaveTextContent('application/pdf');
+    expect(binary).toHaveTextContent('2.0 KiB');
+    expect(binary).toHaveTextContent('a'.repeat(64));
+
+    const download = screen.getByTestId('artifact-download');
+    expect(download).toBeInTheDocument();
+    expect(download.textContent).toMatch(/\.pdf$/);
+    expect(screen.queryByText('JVBERi0xLjQKJeLjz9M=')).toBeNull();
+  });
+
+  it('reveals raw base64 only when the user toggles it on', () => {
+    render(
+      <ArtifactViewer
+        artifacts={[
+          {
+            artifact_id: 'bin1',
+            run_id: 'run_01',
+            span_id: 's01_shell1',
+            type: 'blob',
+            mime: 'application/octet-stream',
+            byte_len: 3,
+            summary: null,
+            content: 'QUJD',
+            content_encoding: 'base64',
+          },
+        ]}
+        selectedSpanId="s01_shell1"
+      />,
+    );
+
+    expect(screen.queryByText('QUJD')).toBeNull();
+    fireEvent.click(screen.getByText(/Show raw base64/));
+    expect(screen.getByText('QUJD')).toBeInTheDocument();
+  });
+
+  it('decodes base64 to the exact bytes when downloading', async () => {
+    vi.useFakeTimers();
+    const createURL = vi.fn<(obj: Blob | MediaSource) => string>(() => 'blob:fake');
+    const revokeURL = vi.fn<(url: string) => void>(() => {});
+    const realCreate = URL.createObjectURL;
+    const realRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = createURL as unknown as typeof URL.createObjectURL;
+    URL.revokeObjectURL = revokeURL as unknown as typeof URL.revokeObjectURL;
+
+    try {
+      render(
+        <ArtifactViewer
+          artifacts={[
+            {
+              artifact_id: 'roundtrip',
+              run_id: 'run_01',
+              span_id: 's01_shell1',
+              type: 'blob',
+              mime: 'application/octet-stream',
+              byte_len: 3,
+              summary: null,
+              content: 'QUJD', // "ABC"
+              content_encoding: 'base64',
+            },
+          ]}
+          selectedSpanId="s01_shell1"
+        />,
+      );
+
+      fireEvent.click(screen.getByTestId('artifact-download'));
+      vi.runAllTimers();
+
+      expect(createURL).toHaveBeenCalledTimes(1);
+      expect(revokeURL).toHaveBeenCalledTimes(1);
+
+      const blobArg = createURL.mock.calls[0][0] as Blob;
+      expect(blobArg.type).toBe('application/octet-stream');
+      const buf = await blobArg.arrayBuffer();
+      expect(Array.from(new Uint8Array(buf))).toEqual([65, 66, 67]);
+    } finally {
+      vi.useRealTimers();
+      URL.createObjectURL = realCreate;
+      URL.revokeObjectURL = realRevoke;
+    }
   });
 });
 

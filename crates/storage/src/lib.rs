@@ -106,6 +106,23 @@ pub trait Storage: Send + Sync {
         run_id: &RunId,
         artifact_id: &ArtifactId,
     ) -> Result<BlobIntegrity, StorageError>;
+
+    /// Atomically remove all ReplayKit-owned persisted state for a failed
+    /// branch command: the target run (and its run-scoped spans, events,
+    /// artifacts, snapshots, edges), the branch row, the replay-job row, and
+    /// any diffs where the target run is either side. For persistent stores
+    /// this is all-or-nothing across the metadata; content-addressed blobs
+    /// are cleaned up best-effort afterwards when no remaining artifact still
+    /// references them.
+    ///
+    /// This does not roll back replay side effects outside ReplayKit storage
+    /// (shell commands, workspace writes, model calls).
+    fn cleanup_branch_execution(
+        &self,
+        target_run_id: &RunId,
+        branch_id: &BranchId,
+        replay_job_id: &ReplayJobId,
+    ) -> Result<(), StorageError>;
 }
 
 /// Report produced by an integrity scan for a single artifact.
@@ -769,6 +786,62 @@ impl Storage for InMemoryStorage {
             byte_len: artifact.byte_len as u64,
         };
         self.blob_store.verify(&blob_ref)
+    }
+
+    fn cleanup_branch_execution(
+        &self,
+        target_run_id: &RunId,
+        branch_id: &BranchId,
+        replay_job_id: &ReplayJobId,
+    ) -> Result<(), StorageError> {
+        let mut state = self.state.write().map_err(|_| {
+            StorageError::Internal("failed to lock storage for branch cleanup".into())
+        })?;
+
+        let removed_artifacts: Vec<ArtifactRecord> = state
+            .artifacts
+            .remove(target_run_id)
+            .map(|records| records.into_values().collect())
+            .unwrap_or_default();
+        state.spans.remove(target_run_id);
+        state.events.remove(target_run_id);
+        state.snapshots.remove(target_run_id);
+        state.edges.remove(target_run_id);
+        state.sequences.remove(target_run_id);
+        state.runs.remove(target_run_id);
+        state.branches.remove(branch_id);
+        state.replay_jobs.remove(replay_job_id);
+        state
+            .diffs
+            .retain(|(src, tgt), _| src != target_run_id && tgt != target_run_id);
+
+        let mut referenced_hashes: BTreeSet<String> = BTreeSet::new();
+        for run_artifacts in state.artifacts.values() {
+            for artifact in run_artifacts.values() {
+                referenced_hashes.insert(artifact.sha256.clone());
+            }
+        }
+        drop(state);
+
+        for artifact in removed_artifacts {
+            if referenced_hashes.contains(&artifact.sha256) {
+                continue;
+            }
+            let blob_ref = BlobRef {
+                sha256: artifact.sha256.clone(),
+                byte_len: artifact.byte_len as u64,
+            };
+            if let Err(err) = self.blob_store.remove(&blob_ref) {
+                tracing::warn!(
+                    artifact_id = %artifact.artifact_id.0,
+                    sha256 = %artifact.sha256,
+                    error = %err,
+                    "best-effort blob cleanup failed during branch cleanup"
+                );
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1828,6 +1901,122 @@ impl Storage for SqliteStorage {
         };
         blob_store.verify(&blob_ref)
     }
+
+    fn cleanup_branch_execution(
+        &self,
+        target_run_id: &RunId,
+        branch_id: &BranchId,
+        replay_job_id: &ReplayJobId,
+    ) -> Result<(), StorageError> {
+        // Phase 1: all metadata cleanup in one transaction. Collect the
+        // target run's artifact blob refs inside the tx so cleanup is
+        // consistent with the deletion.
+        let removed_blob_refs: Vec<BlobRef> = self.with_transaction(|tx| {
+            let mut refs = Vec::new();
+            {
+                let mut stmt = tx
+                    .prepare("SELECT payload_json FROM artifacts WHERE run_id = ?1")
+                    .map_err(map_sqlite_error)?;
+                let rows = stmt
+                    .query_map(params![target_run_id.0], |row| row.get::<_, String>(0))
+                    .map_err(map_sqlite_error)?;
+                for row in rows {
+                    let payload = row.map_err(map_sqlite_error)?;
+                    let artifact: ArtifactRecord = decode_json(&payload)?;
+                    refs.push(BlobRef {
+                        sha256: artifact.sha256,
+                        byte_len: artifact.byte_len as u64,
+                    });
+                }
+            }
+
+            tx.execute(
+                "DELETE FROM diffs WHERE source_run_id = ?1 OR target_run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM artifacts WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM snapshots WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM edges WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM events WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM spans WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM run_sequences WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM branches WHERE branch_id = ?1",
+                params![branch_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM replay_jobs WHERE replay_job_id = ?1",
+                params![replay_job_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+            tx.execute(
+                "DELETE FROM runs WHERE run_id = ?1",
+                params![target_run_id.0],
+            )
+            .map_err(map_sqlite_error)?;
+
+            Ok(refs)
+        })?;
+
+        // Phase 2: best-effort blob cleanup. For each blob referenced only by
+        // the deleted run, try to remove the file. Failures log but do not
+        // fail the already-committed metadata cleanup.
+        let Some(blob_store) = self.blob_store.as_ref() else {
+            return Ok(());
+        };
+
+        self.with_connection(|conn| {
+            for blob_ref in &removed_blob_refs {
+                let still_referenced: Option<()> = conn
+                    .query_row(
+                        "SELECT 1 FROM artifacts WHERE json_extract(payload_json, '$.sha256') = ?1 LIMIT 1",
+                        params![blob_ref.sha256],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(map_sqlite_error)?;
+                if still_referenced.is_some() {
+                    continue;
+                }
+                if let Err(err) = blob_store.remove(blob_ref) {
+                    tracing::warn!(
+                        sha256 = %blob_ref.sha256,
+                        error = %err,
+                        "best-effort blob cleanup failed during branch cleanup"
+                    );
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,8 +2177,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use replaykit_core_model::{
-        ArtifactId, ArtifactRecord, ArtifactType, HostMetadata, ReplayPolicy, RunRecord, RunStatus,
-        SpanId, SpanKind, SpanRecord, SpanStatus, TraceId,
+        ArtifactId, ArtifactRecord, ArtifactType, BranchId, BranchRecord, DiffId, HostMetadata,
+        ReplayJobId, ReplayJobRecord, ReplayJobStatus, ReplayMode, ReplayPolicy, RunDiffRecord,
+        RunRecord, RunStatus, SpanId, SpanKind, SpanRecord, SpanStatus, TraceId,
     };
     use rusqlite::Connection;
 
@@ -2688,6 +2878,324 @@ mod tests {
             BlobIntegrity::HashMismatch { .. } => {} // expected
             other => panic!("expected HashMismatch, got {:?}", other),
         }
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    // ---- Branch cleanup tests ----
+
+    fn minimal_run(run_id: &str) -> RunRecord {
+        let mut run = RunRecord::new(
+            RunId(run_id.into()),
+            TraceId(format!("trace-{run_id}")),
+            "demo",
+            "demo.main",
+            "test-adapter",
+            "0.1.0",
+            1,
+        );
+        run.host = HostMetadata {
+            os: "macos".into(),
+            arch: "arm64".into(),
+            hostname: Some("localhost".into()),
+        };
+        run.status = RunStatus::Running;
+        run
+    }
+
+    fn minimal_span(run_id: &RunId, span_id: &str, trace_id: &TraceId) -> SpanRecord {
+        SpanRecord {
+            run_id: run_id.clone(),
+            span_id: SpanId(span_id.into()),
+            trace_id: trace_id.clone(),
+            parent_span_id: None,
+            sequence_no: 0,
+            kind: SpanKind::Run,
+            name: "root".into(),
+            status: SpanStatus::Running,
+            started_at: 1,
+            ended_at: None,
+            replay_policy: ReplayPolicy::RecordOnly,
+            executor_kind: None,
+            executor_version: None,
+            input_artifact_ids: Vec::new(),
+            output_artifact_ids: Vec::new(),
+            snapshot_id: None,
+            input_fingerprint: None,
+            output_fingerprint: None,
+            environment_fingerprint: None,
+            attributes: BTreeMap::new(),
+            error_code: None,
+            error_summary: None,
+            cost: Default::default(),
+        }
+    }
+
+    fn seed_branch_fixture<S: Storage>(storage: &S) -> (RunId, RunId, BranchId, ReplayJobId) {
+        let source = minimal_run("src-run");
+        let target = minimal_run("tgt-run");
+        let keep = minimal_run("keep-run");
+        storage.insert_run(source.clone()).unwrap();
+        storage.insert_run(target.clone()).unwrap();
+        storage.insert_run(keep.clone()).unwrap();
+
+        let source_span = minimal_span(&source.run_id, "span-src", &source.trace_id);
+        let target_span = minimal_span(&target.run_id, "span-tgt", &target.trace_id);
+        let keep_span = minimal_span(&keep.run_id, "span-keep", &keep.trace_id);
+        storage.upsert_span(source_span.clone()).unwrap();
+        storage.upsert_span(target_span.clone()).unwrap();
+        storage.upsert_span(keep_span.clone()).unwrap();
+
+        // Shared-content artifact on both target and keep runs (same bytes ->
+        // same sha256 -> same blob). Cleanup must preserve the blob.
+        let shared_bytes = b"shared-across-runs";
+        let shared_target = ArtifactRecord {
+            artifact_id: ArtifactId("art-shared-tgt".into()),
+            run_id: target.run_id.clone(),
+            span_id: Some(target_span.span_id.clone()),
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "application/octet-stream".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        storage
+            .store_artifact_with_content(shared_target, shared_bytes)
+            .unwrap();
+        let shared_keep = ArtifactRecord {
+            artifact_id: ArtifactId("art-shared-keep".into()),
+            run_id: keep.run_id.clone(),
+            span_id: Some(keep_span.span_id.clone()),
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "application/octet-stream".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        storage
+            .store_artifact_with_content(shared_keep, shared_bytes)
+            .unwrap();
+
+        // Target-only artifact (cleanup must delete the blob).
+        let target_only = ArtifactRecord {
+            artifact_id: ArtifactId("art-tgt-only".into()),
+            run_id: target.run_id.clone(),
+            span_id: Some(target_span.span_id.clone()),
+            artifact_type: ArtifactType::ToolOutput,
+            mime: "application/octet-stream".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let target_only_stored = storage
+            .store_artifact_with_content(target_only, b"target-unique-bytes")
+            .unwrap();
+
+        // Patch manifest (needed for branch FK) — on the target run.
+        let patch = ArtifactRecord {
+            artifact_id: ArtifactId("art-patch".into()),
+            run_id: target.run_id.clone(),
+            span_id: Some(target_span.span_id.clone()),
+            artifact_type: ArtifactType::PatchManifest,
+            mime: "application/replaykit-patch".into(),
+            sha256: String::new(),
+            byte_len: 0,
+            blob_path: String::new(),
+            summary: BTreeMap::new(),
+            redaction: BTreeMap::new(),
+            created_at: 1,
+        };
+        let patch_stored = storage
+            .store_artifact_with_content(patch, b"patch-manifest")
+            .unwrap();
+
+        let branch_id = BranchId("branch-1".into());
+        let branch = BranchRecord {
+            branch_id: branch_id.clone(),
+            source_run_id: source.run_id.clone(),
+            target_run_id: target.run_id.clone(),
+            fork_span_id: source_span.span_id.clone(),
+            patch_manifest_artifact_id: patch_stored.artifact_id.clone(),
+            created_at: 1,
+            created_by: None,
+            status: RunStatus::Running,
+        };
+        storage.insert_branch(branch).unwrap();
+
+        let replay_job_id = ReplayJobId("replay-1".into());
+        let job = ReplayJobRecord {
+            replay_job_id: replay_job_id.clone(),
+            source_run_id: source.run_id.clone(),
+            target_run_id: Some(target.run_id.clone()),
+            mode: ReplayMode::Forked,
+            status: ReplayJobStatus::Running,
+            created_at: 1,
+            started_at: Some(1),
+            ended_at: None,
+            progress: BTreeMap::new(),
+            error_summary: None,
+        };
+        storage.insert_replay_job(job).unwrap();
+
+        // Two diffs: one involves the target (should be removed), one
+        // unrelated (should be preserved).
+        let involved = RunDiffRecord {
+            diff_id: DiffId("diff-1".into()),
+            source_run_id: source.run_id.clone(),
+            target_run_id: target.run_id.clone(),
+            first_divergent_span_id: None,
+            changed_span_count: 0,
+            changed_artifact_count: 0,
+            source_status: RunStatus::Completed,
+            target_status: RunStatus::Running,
+            summary: BTreeMap::new(),
+            created_at: 1,
+        };
+        storage.insert_diff(involved).unwrap();
+        let unrelated = RunDiffRecord {
+            diff_id: DiffId("diff-2".into()),
+            source_run_id: source.run_id.clone(),
+            target_run_id: keep.run_id.clone(),
+            first_divergent_span_id: None,
+            changed_span_count: 0,
+            changed_artifact_count: 0,
+            source_status: RunStatus::Completed,
+            target_status: RunStatus::Running,
+            summary: BTreeMap::new(),
+            created_at: 1,
+        };
+        storage.insert_diff(unrelated).unwrap();
+
+        // Sanity: the target-only blob exists before cleanup.
+        let target_only_ref = BlobRef {
+            sha256: target_only_stored.sha256.clone(),
+            byte_len: target_only_stored.byte_len as u64,
+        };
+        let _ = target_only_ref; // referenced below via closure returns
+
+        (
+            source.run_id.clone(),
+            target.run_id.clone(),
+            branch_id,
+            replay_job_id,
+        )
+    }
+
+    fn assert_cleanup_state<S: Storage>(
+        storage: &S,
+        target_run_id: &RunId,
+        branch_id: &BranchId,
+        replay_job_id: &ReplayJobId,
+    ) {
+        let target_missing = storage.get_run(target_run_id);
+        assert!(matches!(target_missing, Err(StorageError::NotFound(_))));
+        assert!(storage.list_spans(target_run_id).unwrap().is_empty());
+        assert!(storage.list_artifacts(target_run_id).unwrap().is_empty());
+        assert!(storage.list_snapshots(target_run_id).unwrap().is_empty());
+        assert!(storage.list_edges(target_run_id).unwrap().is_empty());
+        assert!(storage.list_events(target_run_id).unwrap().is_empty());
+
+        let branch_missing = storage.get_branch(branch_id);
+        assert!(matches!(branch_missing, Err(StorageError::NotFound(_))));
+        let job_missing = storage.get_replay_job(replay_job_id);
+        assert!(matches!(job_missing, Err(StorageError::NotFound(_))));
+
+        let source = RunId("src-run".into());
+        let keep = RunId("keep-run".into());
+        let diff_target = storage.get_diff(&source, target_run_id);
+        assert!(matches!(diff_target, Err(StorageError::NotFound(_))));
+        let diff_unrelated = storage.get_diff(&source, &keep).unwrap();
+        assert_eq!(diff_unrelated.diff_id.0, "diff-2");
+
+        // Unrelated runs preserved.
+        storage.get_run(&source).unwrap();
+        storage.get_run(&keep).unwrap();
+        assert_eq!(storage.list_artifacts(&keep).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inmemory_cleanup_branch_execution_removes_scoped_state() {
+        let storage = InMemoryStorage::new();
+        let (_source, target, branch_id, job_id) = seed_branch_fixture(&storage);
+
+        storage
+            .cleanup_branch_execution(&target, &branch_id, &job_id)
+            .unwrap();
+        assert_cleanup_state(&storage, &target, &branch_id, &job_id);
+
+        // Shared blob (referenced by keep-run) still readable.
+        let keep_arts = storage.list_artifacts(&RunId("keep-run".into())).unwrap();
+        assert_eq!(keep_arts.len(), 1);
+        let bytes = storage
+            .read_artifact_content(&RunId("keep-run".into()), &keep_arts[0].artifact_id)
+            .unwrap();
+        assert_eq!(bytes, b"shared-across-runs");
+    }
+
+    #[test]
+    fn sqlite_cleanup_branch_execution_is_transactional_and_removes_orphan_blobs() {
+        let data_root = unique_data_root("branch-cleanup");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let (_source, target, branch_id, job_id) = seed_branch_fixture(&storage);
+
+        let target_only_path = {
+            let art = storage
+                .get_artifact(&target, &ArtifactId("art-tgt-only".into()))
+                .unwrap();
+            PathBuf::from(art.blob_path)
+        };
+        let shared_path = {
+            let art = storage
+                .get_artifact(&target, &ArtifactId("art-shared-tgt".into()))
+                .unwrap();
+            PathBuf::from(art.blob_path)
+        };
+        assert!(target_only_path.exists());
+        assert!(shared_path.exists());
+
+        storage
+            .cleanup_branch_execution(&target, &branch_id, &job_id)
+            .unwrap();
+        assert_cleanup_state(&storage, &target, &branch_id, &job_id);
+
+        // Orphan blob deleted, shared blob preserved.
+        assert!(!target_only_path.exists());
+        assert!(shared_path.exists());
+
+        // Shared blob still readable via the keep run's artifact.
+        let keep_bytes = storage
+            .read_artifact_content(
+                &RunId("keep-run".into()),
+                &ArtifactId("art-shared-keep".into()),
+            )
+            .unwrap();
+        assert_eq!(keep_bytes, b"shared-across-runs");
+
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn sqlite_cleanup_is_idempotent_for_missing_rows() {
+        let data_root = unique_data_root("branch-cleanup-idem");
+        let storage = SqliteStorage::open_with_data_root(&data_root).unwrap();
+        let (_source, target, branch_id, job_id) = seed_branch_fixture(&storage);
+
+        storage
+            .cleanup_branch_execution(&target, &branch_id, &job_id)
+            .unwrap();
+        // Second call is a no-op and must not error.
+        storage
+            .cleanup_branch_execution(&target, &branch_id, &job_id)
+            .unwrap();
 
         let _ = fs::remove_dir_all(&data_root);
     }

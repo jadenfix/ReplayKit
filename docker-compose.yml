@@ -11,6 +11,12 @@ services:
       - "4100:4100"
     volumes:
       - replaykit-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4100/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 2s
 
   api:
     build:
@@ -36,6 +42,33 @@ services:
       - "3210:3210"
     volumes:
       - replaykit-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3210/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 2s
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Vite inlines env at build time — the browser must be able to reach
+        # the API from the host, so this is a host-visible URL (not the
+        # Compose-internal service name).
+        VITE_REPLAYKIT_API_BASE_URL: "http://127.0.0.1:3210"
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 2s
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   replaykit-data:

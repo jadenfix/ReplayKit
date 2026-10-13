@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  build:
-    name: build + smoke
+  stack-smoke:
+    name: compose + browser smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,43 +15,71 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image
-        uses: docker/build-push-action@v6
+      - name: Build compose stack
+        run: docker compose build
+
+      - name: Start compose stack
+        run: docker compose up -d
+
+      - name: Wait for collector /healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:4100/healthz > /dev/null; then
+              echo "collector ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "collector did not become ready"; exit 1
+
+      - name: Wait for api /healthz
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3210/healthz > /dev/null; then
+              echo "api ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "api did not become ready"; exit 1
+
+      - name: Wait for web /
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5173/ > /dev/null; then
+              echo "web ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "web did not become ready"; exit 1
+
+      - name: Seed one run through collector
+        env:
+          REPLAYKIT_COLLECTOR_URL: http://127.0.0.1:4100
+        run: bash scripts/seed-stack-run.sh
+
+      - uses: actions/setup-node@v4
         with:
-          context: .
-          push: false
-          load: true
-          tags: replaykit:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: apps/web/package-lock.json
 
-      - name: Smoke test - collector starts
-        run: |
-          docker run --rm -d --name smoke-collector \
-            -e REPLAYKIT_PORT=4100 \
-            -e REPLAYKIT_DATA_ROOT=/data \
-            -p 4100:4100 \
-            replaykit:ci replaykit-collector
-          for i in $(seq 1 15); do
-            if curl -sf http://localhost:4100/healthz > /dev/null 2>&1; then
-              echo "Collector responded"
-              break
-            fi
-            sleep 1
-          done
-          docker stop smoke-collector
+      - name: Install web deps for Playwright
+        working-directory: apps/web
+        run: npm ci
 
-      - name: Smoke test - API starts
-        run: |
-          docker run --rm -d --name smoke-api \
-            -p 3210:3210 \
-            replaykit:ci \
-            replaykit --storage sqlite --data-root /data serve --port 3210 --host 0.0.0.0
-          for i in $(seq 1 15); do
-            if curl -sf http://localhost:3210/healthz > /dev/null 2>&1; then
-              echo "API responded"
-              break
-            fi
-            sleep 1
-          done
-          docker stop smoke-api
+      - name: Install Playwright browser
+        working-directory: apps/web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright smoke
+        working-directory: apps/web
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:5173
+        run: npm run test:e2e
+
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
