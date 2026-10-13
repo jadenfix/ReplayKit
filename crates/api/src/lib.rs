@@ -545,10 +545,10 @@ mod tests {
 
     use replaykit_collector::{ArtifactSpec, BeginRun, EndSpan, SpanSpec};
     use replaykit_core_model::{
-        ArtifactId, ArtifactType, BranchId, BranchRequest, BranchRecord, CostMetrics, Document,
-        EventRecord, HostMetadata, IdKind, PatchManifest, PatchType, ReplayJobId,
-        ReplayJobRecord, ReplayPolicy, RunDiffRecord, RunStatus, SnapshotId, SnapshotRecord,
-        SpanEdgeRecord, SpanId, SpanKind, SpanStatus, Value,
+        ArtifactId, ArtifactType, BranchId, BranchRecord, BranchRequest, CostMetrics, Document,
+        EventRecord, HostMetadata, IdKind, PatchManifest, PatchType, ReplayJobId, ReplayJobRecord,
+        ReplayPolicy, RunDiffRecord, RunStatus, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId,
+        SpanKind, SpanStatus, Value,
     };
     use replaykit_replay_engine::{ExecutionResult, ProducedArtifact, ReplayExecutionContext};
     use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage, StorageError};

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 # ReplayKit smoke test
 # Proves: collector writes -> API reads -> data persists across restart
 
@@ -26,23 +28,25 @@ echo "Data root: $SMOKE_DATA_ROOT"
 echo ""
 echo "--- Building workspace ---"
 cargo build --workspace --quiet
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 # ── Start collector ──────────────────────────────────────────────────
 echo "--- Starting collector on port $COLLECTOR_PORT ---"
 REPLAYKIT_DATA_ROOT="$SMOKE_DATA_ROOT" \
 REPLAYKIT_PORT="$COLLECTOR_PORT" \
-  cargo run --bin replaykit-collector --quiet 2>/dev/null &
+  "$TARGET_DIR/debug/replaykit-collector" > "$SMOKE_DATA_ROOT/collector.log" 2>&1 &
 COLLECTOR_PID=$!
 
 wait_for_port() {
   local port=$1 timeout=15
   for i in $(seq 1 "$timeout"); do
-    if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+    if (echo > "/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
       return 0
     fi
     sleep 1
   done
   echo "FAIL: port $port not ready after ${timeout}s"
+  cat "$SMOKE_DATA_ROOT"/*.log
   return 1
 }
 
@@ -104,9 +108,9 @@ echo "Finished run."
 # ── Start API server ─────────────────────────────────────────────────
 echo ""
 echo "--- Starting API on port $API_PORT ---"
-cargo run --bin replaykit -- \
+"$TARGET_DIR/debug/replaykit" \
   --storage sqlite --data-root "$SMOKE_DATA_ROOT" \
-  serve --port "$API_PORT" 2>/dev/null &
+  serve --port "$API_PORT" > "$SMOKE_DATA_ROOT/api.log" 2>&1 &
 API_PID=$!
 wait_for_port "$API_PORT"
 echo "API ready."
@@ -147,9 +151,9 @@ API_PID=""
 COLLECTOR_PID=""
 
 # Restart API only
-cargo run --bin replaykit -- \
+"$TARGET_DIR/debug/replaykit" \
   --storage sqlite --data-root "$SMOKE_DATA_ROOT" \
-  serve --port "$API_PORT" 2>/dev/null &
+  serve --port "$API_PORT" > "$SMOKE_DATA_ROOT/api.log" 2>&1 &
 API_PID=$!
 wait_for_port "$API_PORT"
 
