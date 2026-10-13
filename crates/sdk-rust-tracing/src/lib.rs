@@ -215,7 +215,6 @@ pub fn fixed_ids(
 mod tests {
     use std::sync::Arc;
 
-    use replaykit_core_model::*;
     use replaykit_storage::InMemoryStorage;
 
     use super::*;
