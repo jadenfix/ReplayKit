@@ -159,6 +159,34 @@ impl InMemoryStorage {
         Self::default()
     }
 
+    fn insert_artifact_state(
+        state: &mut MemoryState,
+        artifact: ArtifactRecord,
+    ) -> Result<(), StorageError> {
+        Self::ensure_run_exists(state, &artifact.run_id)?;
+        if let Some(span_id) = &artifact.span_id {
+            Self::ensure_span_exists(state, &artifact.run_id, span_id)?;
+        }
+        validate_artifact_record(&artifact)?;
+        if state
+            .artifacts
+            .get(&artifact.run_id)
+            .and_then(|records| records.get(&artifact.artifact_id))
+            .is_some()
+        {
+            return Err(StorageError::Conflict(format!(
+                "artifact {:?} already exists in run {:?}",
+                artifact.artifact_id.0, artifact.run_id.0
+            )));
+        }
+        state
+            .artifacts
+            .entry(artifact.run_id.clone())
+            .or_default()
+            .insert(artifact.artifact_id.clone(), artifact);
+        Ok(())
+    }
+
     pub fn blob_store(&self) -> &InMemoryBlobStore {
         &self.blob_store
     }
@@ -465,28 +493,7 @@ impl Storage for InMemoryStorage {
         let mut state = self.state.write().map_err(|_| {
             StorageError::Internal("failed to lock storage for artifact insert".into())
         })?;
-        Self::ensure_run_exists(&state, &artifact.run_id)?;
-        if let Some(span_id) = &artifact.span_id {
-            Self::ensure_span_exists(&state, &artifact.run_id, span_id)?;
-        }
-        validate_artifact_record(&artifact)?;
-        if state
-            .artifacts
-            .get(&artifact.run_id)
-            .and_then(|records| records.get(&artifact.artifact_id))
-            .is_some()
-        {
-            return Err(StorageError::Conflict(format!(
-                "artifact {:?} already exists in run {:?}",
-                artifact.artifact_id.0, artifact.run_id.0
-            )));
-        }
-        state
-            .artifacts
-            .entry(artifact.run_id.clone())
-            .or_default()
-            .insert(artifact.artifact_id.clone(), artifact);
-        Ok(())
+        Self::insert_artifact_state(&mut state, artifact)
     }
 
     fn get_artifact(
@@ -750,7 +757,13 @@ impl Storage for InMemoryStorage {
         mut artifact: ArtifactRecord,
         content: &[u8],
     ) -> Result<ArtifactRecord, StorageError> {
+        // Cleanup holds this lock through its reference check and blob removal.
+        let mut state = self.state.write().map_err(|_| {
+            StorageError::Internal("failed to lock storage for artifact write".into())
+        })?;
         let blob_ref = self.blob_store.store(content)?;
+        #[cfg(test)]
+        tests::after_blob_store();
         artifact.sha256 = blob_ref.sha256.clone();
         artifact.byte_len = blob_ref.byte_len as usize;
         artifact.blob_path = self
@@ -758,7 +771,7 @@ impl Storage for InMemoryStorage {
             .blob_path(&blob_ref)
             .to_string_lossy()
             .to_string();
-        self.insert_artifact(artifact.clone())?;
+        Self::insert_artifact_state(&mut state, artifact.clone())?;
         Ok(artifact)
     }
 
@@ -821,7 +834,6 @@ impl Storage for InMemoryStorage {
                 referenced_hashes.insert(artifact.sha256.clone());
             }
         }
-        drop(state);
 
         for artifact in removed_artifacts {
             if referenced_hashes.contains(&artifact.sha256) {
@@ -1059,6 +1071,20 @@ impl SqliteStorage {
         Ok(value)
     }
 
+    fn with_immediate_transaction<T>(
+        &self,
+        op: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let mut conn = Connection::open(self.db_path.as_ref()).map_err(map_sqlite_error)?;
+        configure_sqlite_connection(&conn)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let value = op(&tx)?;
+        tx.commit().map_err(map_sqlite_error)?;
+        Ok(value)
+    }
+
     fn ensure_run_exists_conn(conn: &Connection, run_id: &RunId) -> Result<(), StorageError> {
         let exists = conn
             .query_row(
@@ -1090,6 +1116,30 @@ impl SqliteStorage {
                 span_id.0, run_id.0
             ))
         })
+    }
+
+    fn insert_artifact_conn(
+        conn: &Connection,
+        artifact: &ArtifactRecord,
+    ) -> Result<(), StorageError> {
+        let payload = encode_json(artifact)?;
+        Self::ensure_run_exists_conn(conn, &artifact.run_id)?;
+        if let Some(span_id) = &artifact.span_id {
+            Self::ensure_span_exists_conn(conn, &artifact.run_id, span_id)?;
+        }
+        validate_artifact_record(artifact)?;
+        conn.execute(
+            "INSERT INTO artifacts(run_id, artifact_id, created_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![
+                artifact.run_id.0,
+                artifact.artifact_id.0,
+                artifact.created_at,
+                payload
+            ],
+        )
+        .map_err(map_constraint_or_sqlite_error)?;
+        Ok(())
     }
 
     fn get_artifact_conn(
@@ -1508,26 +1558,7 @@ impl Storage for SqliteStorage {
     }
 
     fn insert_artifact(&self, artifact: ArtifactRecord) -> Result<(), StorageError> {
-        let payload = encode_json(&artifact)?;
-        self.with_transaction(|tx| {
-            Self::ensure_run_exists_conn(tx, &artifact.run_id)?;
-            if let Some(span_id) = &artifact.span_id {
-                Self::ensure_span_exists_conn(tx, &artifact.run_id, span_id)?;
-            }
-            validate_artifact_record(&artifact)?;
-            tx.execute(
-                "INSERT INTO artifacts(run_id, artifact_id, created_at, payload_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    artifact.run_id.0,
-                    artifact.artifact_id.0,
-                    artifact.created_at,
-                    payload
-                ],
-            )
-            .map_err(map_constraint_or_sqlite_error)?;
-            Ok(())
-        })
+        self.with_transaction(|tx| Self::insert_artifact_conn(tx, &artifact))
     }
 
     fn get_artifact(
@@ -1837,17 +1868,22 @@ impl Storage for SqliteStorage {
             StorageError::Internal("cannot store artifact content: no blob store configured".into())
         })?;
 
-        // Store blob first (safe orphan on DB failure).
-        let blob_ref = blob_store.store(content)?;
-        artifact.sha256 = blob_ref.sha256.clone();
-        artifact.byte_len = blob_ref.byte_len as usize;
-        artifact.blob_path = blob_store
-            .blob_path(&blob_ref)
-            .to_string_lossy()
-            .to_string();
+        // The database write reservation also coordinates separately opened
+        // storage handles and collector/API processes using this data root.
+        self.with_immediate_transaction(|tx| {
+            let blob_ref = blob_store.store(content)?;
+            #[cfg(test)]
+            tests::after_blob_store();
+            artifact.sha256 = blob_ref.sha256.clone();
+            artifact.byte_len = blob_ref.byte_len as usize;
+            artifact.blob_path = blob_store
+                .blob_path(&blob_ref)
+                .to_string_lossy()
+                .to_string();
 
-        self.insert_artifact(artifact.clone())?;
-        Ok(artifact)
+            Self::insert_artifact_conn(tx, &artifact)?;
+            Ok(artifact)
+        })
     }
 
     fn read_artifact_content(
@@ -1911,7 +1947,7 @@ impl Storage for SqliteStorage {
         // Phase 1: all metadata cleanup in one transaction. Collect the
         // target run's artifact blob refs inside the tx so cleanup is
         // consistent with the deletion.
-        let removed_blob_refs: Vec<BlobRef> = self.with_transaction(|tx| {
+        let removed_blob_refs: Vec<BlobRef> = self.with_immediate_transaction(|tx| {
             let mut refs = Vec::new();
             {
                 let mut stmt = tx
@@ -1991,7 +2027,8 @@ impl Storage for SqliteStorage {
             return Ok(());
         };
 
-        self.with_connection(|conn| {
+        // No artifact writer may publish bytes between this check and removal.
+        self.with_immediate_transaction(|conn| {
             for blob_ref in &removed_blob_refs {
                 let still_referenced: Option<()> = conn
                     .query_row(
@@ -3198,5 +3235,86 @@ mod tests {
             .unwrap();
 
         let _ = fs::remove_dir_all(&data_root);
+    }
+    thread_local! {
+        static AFTER_BLOB_STORE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    // A per-thread test hook pauses a real artifact write between its blob and
+    // metadata operations. Production builds do not contain the hook.
+    pub(super) fn after_blob_store() {
+        if let Some(hook) = AFTER_BLOB_STORE.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    fn concurrent_store_and_cleanup<S: Storage + Clone + Send + Sync + 'static>(
+        storage: S,
+        cleaner_storage: S,
+    ) {
+        use std::sync::{Barrier, mpsc};
+        let (_source, target, branch, job) = seed_branch_fixture(&storage);
+        let original = storage
+            .get_artifact(&target, &ArtifactId("art-tgt-only".into()))
+            .unwrap();
+        let mut survivor = original;
+        survivor.run_id = RunId("keep-run".into());
+        survivor.artifact_id = ArtifactId("new-survivor".into());
+        survivor.span_id = None;
+        let paused = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let writer_storage = storage.clone();
+        let writer_paused = paused.clone();
+        let writer_resume = resume.clone();
+        let writer = thread::spawn(move || {
+            AFTER_BLOB_STORE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    writer_paused.wait();
+                    writer_resume.wait();
+                }))
+            });
+            writer_storage.store_artifact_with_content(survivor, b"target-unique-bytes")
+        });
+        paused.wait();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleaner = thread::spawn(move || {
+            let result = cleaner_storage.cleanup_branch_execution(&target, &branch, &job);
+            done_tx.send(()).unwrap();
+            result
+        });
+        // Cleanup must not remove a blob while a writer has materialized it
+        // and still owns the right to publish its metadata.
+        let premature_cleanup = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        resume.wait();
+        writer.join().unwrap().unwrap();
+        cleaner.join().unwrap().unwrap();
+        let bytes = storage.read_artifact_content(
+            &RunId("keep-run".into()),
+            &ArtifactId("new-survivor".into()),
+        );
+        assert_eq!(bytes.unwrap(), b"target-unique-bytes");
+        assert!(
+            !premature_cleanup,
+            "cleanup passed an in-flight artifact writer"
+        );
+    }
+
+    #[test]
+    fn inmemory_cleanup_preserves_inflight_shared_blob_writer() {
+        let storage = InMemoryStorage::new();
+        concurrent_store_and_cleanup(storage.clone(), storage);
+    }
+
+    #[test]
+    fn sqlite_cleanup_preserves_inflight_shared_blob_writer() {
+        let root = unique_data_root("concurrent-cleanup");
+        // Independent handles model collector and API processes sharing a root.
+        concurrent_store_and_cleanup(
+            SqliteStorage::open_with_data_root(&root).unwrap(),
+            SqliteStorage::open_with_data_root(&root).unwrap(),
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
