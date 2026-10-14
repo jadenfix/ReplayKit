@@ -95,6 +95,7 @@ export interface ArtifactRecord {
   summary: string | null;
   content: string;
   content_encoding?: 'utf-8' | 'base64';
+  sha256?: string | null;
 }
 
 export interface SpanEdgeRecord {

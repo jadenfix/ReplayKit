@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use axum::http::{Method, StatusCode, header};
 use axum_test::TestServer;
 use replaykit_api::ReplayKitService;
 use replaykit_api::server::build_router;
@@ -9,7 +10,7 @@ use replaykit_core_model::{
     SpanKind, SpanStatus,
 };
 use replaykit_replay_engine::{ExecutorRegistry, ReplayError, ReplayExecutionContext};
-use replaykit_storage::{InMemoryStorage, Storage};
+use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage, StorageError};
 
 // ---------------------------------------------------------------------------
 // Test executor that supports LlmCall spans
@@ -430,6 +431,43 @@ async fn healthz_returns_200() {
 }
 
 #[tokio::test]
+async fn options_preflight_returns_cors_headers() {
+    let (server, _) = seeded_server();
+    let resp = server
+        .method(Method::OPTIONS, "/api/v1/runs")
+        .add_header(header::ORIGIN, "http://127.0.0.1:5173")
+        .add_header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .await;
+    assert!(
+        resp.status_code().is_success(),
+        "preflight should succeed, got {}",
+        resp.status_code()
+    );
+    assert_eq!(
+        resp.header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .to_str()
+            .unwrap(),
+        "http://127.0.0.1:5173"
+    );
+}
+
+#[tokio::test]
+async fn get_routes_include_cors_headers_for_allowed_origin() {
+    let (server, _) = seeded_server();
+    let resp = server
+        .get("/api/v1/runs")
+        .add_header(header::ORIGIN, "http://localhost:5173")
+        .await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(
+        resp.header(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .to_str()
+            .unwrap(),
+        "http://localhost:5173"
+    );
+}
+
+#[tokio::test]
 async fn get_run_returns_200() {
     let (server, run_id) = seeded_server();
     let resp = server.get(&format!("/api/v1/runs/{}", run_id.0)).await;
@@ -660,6 +698,49 @@ async fn artifact_content_binary_round_trips_via_base64() {
         .decode(body["content"].as_str().unwrap())
         .unwrap();
     assert_eq!(decoded, binary_bytes);
+}
+
+#[tokio::test]
+async fn artifact_content_forces_base64_for_binary_mime_even_if_utf8_valid() {
+    // Regression: UTF-8 validity alone must not decide encoding. Bytes that
+    // happen to be valid UTF-8 (e.g. pure ASCII) under a binary mime like
+    // application/octet-stream must still come back base64, so the web
+    // ArtifactViewer routes them through the binary metadata + download UX
+    // instead of dumping them as text.
+    let (server, run_id, storage) = seeded_server_with_storage();
+    let ascii_bytes: &[u8] = b"\x00\x01\x02\x03hello world"; // valid UTF-8
+    assert!(std::str::from_utf8(ascii_bytes).is_ok());
+    let artifact = replaykit_core_model::ArtifactRecord {
+        artifact_id: replaykit_core_model::ArtifactId("octet-ascii".into()),
+        run_id: run_id.clone(),
+        span_id: None,
+        artifact_type: ArtifactType::ToolOutput,
+        mime: "application/octet-stream".into(),
+        sha256: "placeholder".into(),
+        byte_len: 0,
+        blob_path: "memory://placeholder".into(),
+        summary: Document::new(),
+        redaction: Document::new(),
+        created_at: 11,
+    };
+    storage
+        .store_artifact_with_content(artifact, ascii_bytes)
+        .unwrap();
+
+    let resp = server
+        .get(&format!(
+            "/api/v1/runs/{}/artifacts/{}/content",
+            run_id.0, "octet-ascii"
+        ))
+        .await;
+    resp.assert_status_ok();
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["content_encoding"], "base64");
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body["content"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(decoded, ascii_bytes);
 }
 
 #[tokio::test]
@@ -954,4 +1035,234 @@ async fn diff_golden_shape() {
     for key in &["span_id_source", "span_id_target", "name", "output_changed"] {
         assert!(sd.get(key).is_some(), "missing key '{key}' in SpanDiffView");
     }
+}
+
+// ---------------------------------------------------------------------------
+// SQLite-backed integration test: diff insert failure triggers branch cleanup.
+// ---------------------------------------------------------------------------
+
+struct SqliteDiffFail {
+    inner: Arc<SqliteStorage>,
+}
+
+impl SqliteDiffFail {
+    fn new(inner: Arc<SqliteStorage>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Storage for SqliteDiffFail {
+    fn allocate_id(&self, kind: replaykit_core_model::IdKind) -> Result<String, StorageError> {
+        self.inner.allocate_id(kind)
+    }
+    fn next_sequence(&self, run_id: &RunId) -> Result<u64, StorageError> {
+        self.inner.next_sequence(run_id)
+    }
+    fn insert_run(&self, run: replaykit_core_model::RunRecord) -> Result<(), StorageError> {
+        self.inner.insert_run(run)
+    }
+    fn update_run(&self, run: replaykit_core_model::RunRecord) -> Result<(), StorageError> {
+        self.inner.update_run(run)
+    }
+    fn get_run(&self, run_id: &RunId) -> Result<replaykit_core_model::RunRecord, StorageError> {
+        self.inner.get_run(run_id)
+    }
+    fn list_runs(&self) -> Result<Vec<replaykit_core_model::RunRecord>, StorageError> {
+        self.inner.list_runs()
+    }
+    fn upsert_span(&self, span: replaykit_core_model::SpanRecord) -> Result<(), StorageError> {
+        self.inner.upsert_span(span)
+    }
+    fn get_span(
+        &self,
+        run_id: &RunId,
+        span_id: &SpanId,
+    ) -> Result<replaykit_core_model::SpanRecord, StorageError> {
+        self.inner.get_span(run_id, span_id)
+    }
+    fn list_spans(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<replaykit_core_model::SpanRecord>, StorageError> {
+        self.inner.list_spans(run_id)
+    }
+    fn insert_event(&self, event: replaykit_core_model::EventRecord) -> Result<(), StorageError> {
+        self.inner.insert_event(event)
+    }
+    fn list_events(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<replaykit_core_model::EventRecord>, StorageError> {
+        self.inner.list_events(run_id)
+    }
+    fn insert_artifact(
+        &self,
+        artifact: replaykit_core_model::ArtifactRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.insert_artifact(artifact)
+    }
+    fn get_artifact(
+        &self,
+        run_id: &RunId,
+        artifact_id: &replaykit_core_model::ArtifactId,
+    ) -> Result<replaykit_core_model::ArtifactRecord, StorageError> {
+        self.inner.get_artifact(run_id, artifact_id)
+    }
+    fn list_artifacts(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<replaykit_core_model::ArtifactRecord>, StorageError> {
+        self.inner.list_artifacts(run_id)
+    }
+    fn insert_snapshot(
+        &self,
+        snapshot: replaykit_core_model::SnapshotRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.insert_snapshot(snapshot)
+    }
+    fn get_snapshot(
+        &self,
+        run_id: &RunId,
+        snapshot_id: &replaykit_core_model::SnapshotId,
+    ) -> Result<replaykit_core_model::SnapshotRecord, StorageError> {
+        self.inner.get_snapshot(run_id, snapshot_id)
+    }
+    fn list_snapshots(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<replaykit_core_model::SnapshotRecord>, StorageError> {
+        self.inner.list_snapshots(run_id)
+    }
+    fn insert_edge(&self, edge: replaykit_core_model::SpanEdgeRecord) -> Result<(), StorageError> {
+        self.inner.insert_edge(edge)
+    }
+    fn list_edges(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<replaykit_core_model::SpanEdgeRecord>, StorageError> {
+        self.inner.list_edges(run_id)
+    }
+    fn insert_branch(
+        &self,
+        branch: replaykit_core_model::BranchRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.insert_branch(branch)
+    }
+    fn get_branch(
+        &self,
+        branch_id: &replaykit_core_model::BranchId,
+    ) -> Result<replaykit_core_model::BranchRecord, StorageError> {
+        self.inner.get_branch(branch_id)
+    }
+    fn list_branches(&self) -> Result<Vec<replaykit_core_model::BranchRecord>, StorageError> {
+        self.inner.list_branches()
+    }
+    fn insert_replay_job(
+        &self,
+        job: replaykit_core_model::ReplayJobRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.insert_replay_job(job)
+    }
+    fn update_replay_job(
+        &self,
+        job: replaykit_core_model::ReplayJobRecord,
+    ) -> Result<(), StorageError> {
+        self.inner.update_replay_job(job)
+    }
+    fn get_replay_job(
+        &self,
+        replay_job_id: &replaykit_core_model::ReplayJobId,
+    ) -> Result<replaykit_core_model::ReplayJobRecord, StorageError> {
+        self.inner.get_replay_job(replay_job_id)
+    }
+    fn insert_diff(&self, _diff: replaykit_core_model::RunDiffRecord) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "synthetic sqlite diff storage failure".into(),
+        ))
+    }
+    fn get_diff(
+        &self,
+        source: &RunId,
+        target: &RunId,
+    ) -> Result<replaykit_core_model::RunDiffRecord, StorageError> {
+        self.inner.get_diff(source, target)
+    }
+    fn store_artifact_with_content(
+        &self,
+        artifact: replaykit_core_model::ArtifactRecord,
+        content: &[u8],
+    ) -> Result<replaykit_core_model::ArtifactRecord, StorageError> {
+        self.inner.store_artifact_with_content(artifact, content)
+    }
+    fn read_artifact_content(
+        &self,
+        run_id: &RunId,
+        artifact_id: &replaykit_core_model::ArtifactId,
+    ) -> Result<Vec<u8>, StorageError> {
+        self.inner.read_artifact_content(run_id, artifact_id)
+    }
+    fn verify_artifact_integrity(
+        &self,
+        run_id: &RunId,
+        artifact_id: &replaykit_core_model::ArtifactId,
+    ) -> Result<replaykit_storage::BlobIntegrity, StorageError> {
+        self.inner.verify_artifact_integrity(run_id, artifact_id)
+    }
+    fn cleanup_branch_execution(
+        &self,
+        target_run_id: &RunId,
+        branch_id: &replaykit_core_model::BranchId,
+        replay_job_id: &replaykit_core_model::ReplayJobId,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .cleanup_branch_execution(target_run_id, branch_id, replay_job_id)
+    }
+}
+
+#[tokio::test]
+async fn sqlite_branch_creation_cleans_up_after_diff_failure() {
+    let data_root = std::env::temp_dir().join(format!(
+        "replaykit-route-branch-cleanup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sqlite = Arc::new(SqliteStorage::open_with_data_root(&data_root).unwrap());
+    let wrapped = Arc::new(SqliteDiffFail::new(sqlite.clone()));
+    let service = Arc::new(ReplayKitService::new(wrapped, FakeExecutorRegistry));
+    let run = seed_run(&service);
+    let source_run_id = run.run_id.clone();
+
+    let runs_before = sqlite.list_runs().unwrap().len();
+    let branches_before = sqlite.list_branches().unwrap().len();
+
+    let err = service
+        .create_branch(replaykit_core_model::BranchRequest {
+            source_run_id: source_run_id.clone(),
+            fork_span_id: SpanId("tool".into()),
+            patch_manifest: replaykit_core_model::PatchManifest {
+                patch_type: replaykit_core_model::PatchType::ToolOutputOverride,
+                target_artifact_id: None,
+                replacement: replaykit_core_model::Value::Text("patched tool result".into()),
+                note: None,
+                created_at: 20,
+            },
+            created_by: Some("test".into()),
+        })
+        .unwrap_err();
+
+    let message = format!("{err}");
+    assert!(
+        message.contains("synthetic sqlite diff storage failure"),
+        "unexpected error: {message}"
+    );
+
+    // Cleanup ran against persistent SQLite storage.
+    assert_eq!(sqlite.list_runs().unwrap().len(), runs_before);
+    assert_eq!(sqlite.list_branches().unwrap().len(), branches_before);
+    let source_artifacts = sqlite.list_artifacts(&source_run_id).unwrap();
+    assert!(!source_artifacts.is_empty(), "source run must survive");
+
+    let _ = std::fs::remove_dir_all(&data_root);
 }
