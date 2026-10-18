@@ -1153,6 +1153,7 @@ dependencies = [
 name = "replaykit-replay-engine"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "replaykit-collector",
  "replaykit-core-model",
  "replaykit-storage",

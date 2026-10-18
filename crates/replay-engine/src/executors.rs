@@ -195,12 +195,13 @@ fn run_shell(
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
             #[cfg(unix)]
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: kill(2) with a negative pid signals the process
+                // group we created for this child; it has no memory effects.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             timed_out = true;
             break child.wait()?;
