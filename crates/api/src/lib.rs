@@ -14,8 +14,12 @@ use replaykit_core_model::{
     SpanRecord, SpanStatus,
 };
 use replaykit_diff_engine::DiffEngine;
-use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine};
+use replaykit_replay_engine::{BranchExecution, ExecutorRegistry, ReplayEngine, ReplayOptions};
 use replaykit_storage::Storage;
+use replaykit_storage::workspace::{
+    WorkspaceFileDiff, WorkspacePhase, diff_workspaces, list_workspace_points,
+    load_workspace_archive,
+};
 
 pub use crate::errors::{ApiError, ApiErrorBody};
 
@@ -34,6 +38,37 @@ impl<S: Storage, E: ExecutorRegistry> ReplayKitService<S, E> {
             diff: DiffEngine::new(storage.clone()),
             storage,
         }
+    }
+
+    /// Configure where replay sandboxes live and whether they are kept.
+    pub fn with_replay_options(mut self, options: ReplayOptions) -> Self {
+        self.replay = self.replay.with_options(options);
+        self
+    }
+
+    /// File-level difference between the final recorded workspaces of two
+    /// runs (e.g. a source run and one of its branches). `.git` internals
+    /// are skipped.
+    pub fn workspace_diff(
+        &self,
+        source_run_id: &RunId,
+        target_run_id: &RunId,
+    ) -> Result<Vec<WorkspaceFileDiff>, ApiError> {
+        let end_archive = |run_id: &RunId| -> Result<_, ApiError> {
+            let point = list_workspace_points(&*self.storage, run_id)?
+                .into_iter()
+                .rfind(|point| point.phase == WorkspacePhase::End)
+                .ok_or_else(|| {
+                    ApiError::Storage(replaykit_storage::StorageError::NotFound(format!(
+                        "run {:?} has no recorded workspace",
+                        run_id.0
+                    )))
+                })?;
+            Ok(load_workspace_archive(&*self.storage, &point.snapshot)?)
+        };
+        let before = end_archive(source_run_id)?;
+        let after = end_archive(target_run_id)?;
+        Ok(diff_workspaces(&before, &after, &[".git"]))
     }
 
     // -----------------------------------------------------------------------
@@ -1422,6 +1457,7 @@ mod tests {
                 hostname: None,
             },
             labels: Vec::new(),
+            workspace_root: None,
         }
     }
 

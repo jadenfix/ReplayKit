@@ -77,6 +77,8 @@ pub fn parse_patch_type(s: &str) -> Result<replaykit_core_model::PatchType, ApiE
         "model_config_edit" => Ok(PatchType::ModelConfigEdit),
         "retrieval_context_override" => Ok(PatchType::RetrievalContextOverride),
         "snapshot_override" => Ok(PatchType::SnapshotOverride),
+        "command_override" => Ok(PatchType::CommandOverride),
+        "file_content_override" => Ok(PatchType::FileContentOverride),
         other => Err(ApiErrorBody::invalid_input(format!(
             "unknown patch_type: {other}"
         ))),

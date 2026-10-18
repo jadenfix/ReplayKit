@@ -69,6 +69,39 @@ Seed one real run into the running stack:
 bash scripts/seed-stack-run.sh
 ```
 
+## Hermetic Replay
+
+Forks re-execute only the affected spans, in a private sandbox restored from the
+workspace the run recorded — never in your working tree.
+
+- Record with a `workspace_root` (collector `POST /v1/runs`): the collector
+  snapshots the workspace before and after every span.
+- Patches reach executors: `command_override` (shell/tool command, cwd, env),
+  `env_var_override` (env for the span and its descendants),
+  `file_content_override`, `tool_output_override`, `prompt_edit`,
+  `model_config_edit`, `snapshot_override`. Inputs recorded as `input_bindings`
+  templates (e.g. `python3 run_tests.py {{select_tests|words}}`) are re-rendered
+  from replayed upstream outputs.
+- `replay plan` reports blocked spans with reasons from the same executors that
+  run the fork. LLM calls are blocked by default; use
+  `--model-mode recorded [--model-fixtures FILE]` to replay recorded responses or
+  `--model-mode command --model-command CMD` to plug in a provider (JSON request
+  on stdin, response on stdout).
+
+Try it with the scripted agent in `examples/scripted-agent`:
+
+```bash
+python3 examples/scripted-agent/agent.py make-repo /tmp/rk-ws
+REPLAYKIT_DATA_ROOT=./data cargo run --bin replaykit-collector &
+RUN=$(python3 examples/scripted-agent/agent.py run --workspace /tmp/rk-ws)
+RK="cargo run -q --bin replaykit -- --storage sqlite --data-root ./data"
+$RK replay fork $RUN --span test_validate --patch-type env_var_override --replacement AUTH_POOL_TIMEOUT=0.05
+$RK --model-mode command --model-command "python3 examples/scripted-agent/fixer.py" \
+  replay fork $RUN --span gen_fix --patch-type prompt_edit --patch my-prompt.txt
+```
+
+See [replay-semantics.md](./agent-instructions/replay-semantics.md) for details.
+
 ## Storage Layout
 
 Both collector and API share a data root directory:

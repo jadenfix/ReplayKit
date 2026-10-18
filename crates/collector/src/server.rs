@@ -84,6 +84,9 @@ pub struct BeginRunRequest {
     pub host: Option<HostMetadataDto>,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Directory the agent works in; enables per-span workspace snapshots.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -254,6 +257,7 @@ async fn begin_run(
             hostname: host.hostname,
         },
         labels: req.labels,
+        workspace_root: req.workspace_root,
     })?;
     tracing::info!(run_id = %run.run_id.0, "run started");
     Ok(Json(run))
@@ -553,7 +557,15 @@ pub async fn serve(
         }
     }
 
-    let collector = Collector::new(Arc::new(storage));
+    let mut collector = Collector::new(Arc::new(storage)).with_workspace_excludes(vec![
+        std::fs::canonicalize(&data_root).unwrap_or(data_root.clone()),
+    ]);
+    if let Some(max_bytes) = std::env::var("REPLAYKIT_WORKSPACE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        collector = collector.with_workspace_max_bytes(max_bytes);
+    }
     let app = build_router(collector);
 
     tracing::info!(%addr, data_root = %data_root.display(), "collector server starting");

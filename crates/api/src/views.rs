@@ -565,6 +565,7 @@ pub struct BranchExecutionView {
     pub dirty_span_count: usize,
     pub blocked_span_count: usize,
     pub reusable_span_count: usize,
+    pub plan: BranchPlanView,
 }
 
 impl BranchExecutionView {
@@ -584,6 +585,7 @@ impl BranchExecutionView {
             dirty_span_count: plan.dirty_spans.len(),
             blocked_span_count: plan.blocked_spans.len(),
             reusable_span_count: plan.reusable_spans.len(),
+            plan: BranchPlanView::from_plan(plan),
         }
     }
 }
@@ -644,6 +646,17 @@ pub struct BranchPlanView {
     pub dirty_spans: Vec<DirtySpanView>,
     pub blocked_span_ids: Vec<String>,
     pub reusable_span_ids: Vec<String>,
+    /// Blocked spans with the executor registry's reason.
+    pub blocked: Vec<PlanBlockedSpanView>,
+    pub warnings: Vec<String>,
+    /// Containers whose status is re-derived from replayed descendants.
+    pub rollup_span_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanBlockedSpanView {
+    pub span_id: String,
+    pub reason: String,
 }
 
 impl BranchPlanView {
@@ -658,6 +671,16 @@ impl BranchPlanView {
                 .collect(),
             blocked_span_ids: p.blocked_spans.iter().map(|id| id.0.clone()).collect(),
             reusable_span_ids: p.reusable_spans.iter().map(|id| id.0.clone()).collect(),
+            blocked: p
+                .blocked
+                .iter()
+                .map(|b| PlanBlockedSpanView {
+                    span_id: b.span_id.0.clone(),
+                    reason: b.reason.clone(),
+                })
+                .collect(),
+            warnings: p.warnings.clone(),
+            rollup_span_ids: p.rollup_spans.iter().map(|id| id.0.clone()).collect(),
         }
     }
 }

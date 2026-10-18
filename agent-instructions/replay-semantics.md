@@ -160,6 +160,77 @@ Likely impact:
 - current retrieval span
 - downstream planner and answer spans
 
+### Command override (`command_override`)
+
+Replaces the command of a `shell_command` or `tool_call` before it re-runs:
+plain text replaces `command`; a JSON object may set `command`, `cwd` and `env`.
+
+### File content override (`file_content_override`)
+
+For a `file_write`, replaces the content written (the write then happens in the
+replay sandbox). For a `file_read`, replaces what the read returned.
+
+### Snapshot override (`snapshot_override`)
+
+Starts the replay sandbox from another workspace: a workspace snapshot id of the
+source run, or a directory to capture.
+
+## How patch values reach executors
+
+Executors never read recorded attributes directly. For every span it re-runs,
+the engine builds an *effective span*:
+
+1. attributes named in the span's `input_bindings` are re-rendered from the
+   replayed outputs of the referenced upstream spans
+   (`{{span_id}}`, `{{span_id|trim}}`, `{{span_id|words}}`);
+2. the patch is applied to the fork span (prompt, command, cwd, env, file
+   content, model config). A patched value may itself contain placeholders;
+3. env overrides apply to the fork span and all of its descendants.
+
+The effective attributes are persisted on the branch span, so the branch shows
+exactly what ran.
+
+## Hermetic workspace
+
+A run that declares `workspace_root` gets a workspace snapshot before and after
+every span and at the end of the run (deterministic archives in the blob store,
+deduplicated by content). A fork:
+
+- restores the snapshot taken right before the first dirty span into a private
+  sandbox (never the live working tree);
+- walks the recorded timeline: re-executed spans change the sandbox live, and the
+  recorded workspace changes of every span it does not re-execute are re-applied;
+- maps recorded paths and `cwd` into the sandbox and blocks any path outside the
+  recorded workspace;
+- records the replayed workspace timeline in the branch run (so branches can be
+  forked hermetically too) and deletes the sandbox unless asked to keep it.
+
+`replaykit runs workspace-diff SRC DST` compares the final workspaces of two runs.
+
+## Model executor modes
+
+`llm_call` replays never reach a provider unless configured:
+
+- `blocked` (default): blocks, and the plan says so before anything runs;
+- `recorded`: deterministic; serves responses from a fixtures file keyed by
+  (model, exact prompt), or the span's own recorded response when its effective
+  prompt and model are unchanged;
+- `command`: a pluggable provider; runs a command with the JSON request on stdin
+  and uses stdout as the response.
+
+## Planning agrees with execution
+
+`plan_fork` asks the same executor registry that will run the fork whether each
+dirty span can execute (with its effective, patched inputs) and propagates
+blocks downstream, so `blocked` lists every span the replay will block, each with
+a reason. Execution may do *less* than the plan: a dirty span whose upstream
+replayed to its recorded output is reused (early cutoff), and output
+fingerprints are content hashes so recorders can produce matching values.
+
+Container spans (`run`, `planner_step`, `subgraph`) are executed last by the
+planner-step executor: their recorded output is reused and their status is
+re-derived from their replayed children (`rollup_spans` in the plan).
+
 ## Dependency semantics
 
 ReplayKit must distinguish:
@@ -199,8 +270,9 @@ ReplayKit may reuse a span result only when:
 
 Replay must stop clearly when:
 
-- a dirty span is `record_only`
-- a required executor is not registered
+- a required executor is not registered (or, for model calls, the model mode
+  cannot serve the effective prompt)
+- a path or working directory lies outside the recorded workspace
 - a required artifact is missing
 - redaction removed required input material
 
