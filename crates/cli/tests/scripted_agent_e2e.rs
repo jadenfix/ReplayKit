@@ -276,6 +276,9 @@ fn scripted_agent_forks_replay_hermetically_with_patched_inputs() {
         h.storage.get_run(&env).unwrap().status,
         RunStatus::Completed
     );
+    // Containers re-derive their status; the divergence is the test step.
+    let diff = h.cli(&["runs", "diff", &source.0, &env.0]);
+    assert_eq!(diff["first_divergent_span_id"], "test_validate");
 
     // 3. Tool output patch: the narrowed test list flows into both test
     //    commands through their input bindings.
