@@ -12,7 +12,10 @@ use replaykit_api::{ApiError, ReplayKitService};
 use replaykit_core_model::{
     BranchRequest, PatchManifest, PatchType, RunId, RunTreeNode, SpanId, SpanKind, Value,
 };
-use replaykit_replay_engine::executors::CompositeExecutorRegistry;
+use replaykit_replay_engine::ReplayOptions;
+use replaykit_replay_engine::executors::{
+    CommandModelExecutor, CompositeExecutorRegistry, ModelExecutorMode, RecordedModelExecutor,
+};
 use replaykit_sdk_rust_tracing::{CompletedSpanSpec, SemanticSession, summary_from_pairs};
 use replaykit_storage::{InMemoryStorage, SqliteStorage, Storage};
 
@@ -34,6 +37,34 @@ struct Cli {
     /// Output as JSON instead of human-readable text
     #[arg(long, global = true)]
     json: bool,
+
+    /// How LlmCall spans replay: "blocked" (never call a model), "recorded"
+    /// (replay recorded responses / --model-fixtures), or "command" (run
+    /// --model-command with the JSON request on stdin)
+    #[arg(
+        long,
+        global = true,
+        env = "REPLAYKIT_MODEL_MODE",
+        default_value = "blocked"
+    )]
+    model_mode: String,
+
+    /// JSON file of recorded responses for --model-mode recorded:
+    /// {"responses": [{"model"?, "prompt", "response"}]}
+    #[arg(long, global = true, env = "REPLAYKIT_MODEL_FIXTURES")]
+    model_fixtures: Option<String>,
+
+    /// Provider command for --model-mode command
+    #[arg(long, global = true, env = "REPLAYKIT_MODEL_COMMAND")]
+    model_command: Option<String>,
+
+    /// Directory for hermetic replay sandboxes (default: system temp dir)
+    #[arg(long, global = true, env = "REPLAYKIT_SANDBOX_ROOT")]
+    sandbox_root: Option<String>,
+
+    /// Keep each replay sandbox after the fork (path in replay_job.progress.sandbox)
+    #[arg(long, global = true)]
+    keep_sandbox: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -108,6 +139,13 @@ enum RunsAction {
         /// Span ID
         span_id: String,
     },
+    /// File-level diff of two runs' final recorded workspaces
+    WorkspaceDiff {
+        /// Source run ID
+        source: String,
+        /// Target run ID
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,7 +167,8 @@ enum ReplayAction {
         #[arg(long, default_value = "tool_output_override")]
         patch_type: String,
     },
-    /// Preview what a fork would do (dry-run)
+    /// Preview what a fork would do (dry-run): dirty, blocked (with
+    /// reasons from the configured executors) and reusable spans
     Plan {
         /// Source run ID
         run_id: String,
@@ -142,6 +181,9 @@ enum ReplayAction {
         /// Inline replacement value
         #[arg(long, default_value = "")]
         replacement: String,
+        /// Path to a file holding the replacement (overrides --replacement)
+        #[arg(long)]
+        patch: Option<String>,
     },
 }
 
@@ -168,6 +210,38 @@ fn die_msg(msg: &str) -> ! {
 // Main
 // ---------------------------------------------------------------------------
 
+fn build_registry(cli: &Cli) -> CompositeExecutorRegistry {
+    let mode = match cli.model_mode.as_str() {
+        "blocked" => ModelExecutorMode::Blocked,
+        "recorded" => {
+            let executor = match &cli.model_fixtures {
+                Some(path) => {
+                    RecordedModelExecutor::from_json_file(path).unwrap_or_else(|e| die_msg(&e))
+                }
+                None => RecordedModelExecutor::default(),
+            };
+            ModelExecutorMode::Recorded(executor)
+        }
+        "command" => match &cli.model_command {
+            Some(command) => ModelExecutorMode::Command(CommandModelExecutor::new(command)),
+            None => die_msg("--model-mode command requires --model-command"),
+        },
+        other => die_msg(&format!(
+            "unknown --model-mode {other:?} (expected blocked, recorded or command)"
+        )),
+    };
+    CompositeExecutorRegistry::new().with_model_mode(mode)
+}
+
+fn replay_options(cli: &Cli) -> ReplayOptions {
+    let mut options = ReplayOptions::default();
+    if let Some(root) = &cli.sandbox_root {
+        options.sandbox_root = root.into();
+    }
+    options.keep_sandbox = cli.keep_sandbox;
+    options
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -191,10 +265,10 @@ fn main() {
 }
 
 fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
-    let service = Arc::new(ReplayKitService::new(
-        storage.clone(),
-        CompositeExecutorRegistry::new(),
-    ));
+    let service = Arc::new(
+        ReplayKitService::new(storage.clone(), build_registry(&cli))
+            .with_replay_options(replay_options(&cli)),
+    );
     let json = cli.json;
 
     match cli.command {
@@ -211,6 +285,9 @@ fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
             }
             RunsAction::Deps { run_id, span_id } => {
                 cmd_span_deps(&service, &run_id, &span_id, json)
+            }
+            RunsAction::WorkspaceDiff { source, target } => {
+                cmd_workspace_diff(&service, &source, &target, json)
             }
         },
         Commands::Replay { action } => match action {
@@ -234,7 +311,16 @@ fn dispatch<S: Storage + 'static>(cli: Cli, storage: Arc<S>) {
                 span,
                 patch_type,
                 replacement,
-            } => cmd_replay_plan(&service, &run_id, &span, &patch_type, &replacement, json),
+                patch,
+            } => {
+                let replacement = match patch {
+                    Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                        die_msg(&format!("failed to read patch file {path}: {e}"))
+                    }),
+                    None => replacement,
+                };
+                cmd_replay_plan(&service, &run_id, &span, &patch_type, &replacement, json)
+            }
         },
         Commands::Serve { port, host } => cmd_serve(service, port, &host),
         Commands::Demo => cmd_demo(storage, &service, json),
@@ -535,6 +621,45 @@ fn cmd_replay_fork<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
             .collect();
         println!("    {} [{}]", dirty.span_id.0, reasons.join(", "));
     }
+    print_blocked_and_warnings(&execution.plan);
+}
+
+fn print_blocked_and_warnings(plan: &replaykit_core_model::BranchPlan) {
+    if !plan.rollup_spans.is_empty() {
+        let ids: Vec<&str> = plan.rollup_spans.iter().map(|id| id.0.as_str()).collect();
+        println!("  Status re-derived: {}", ids.join(", "));
+    }
+    if !plan.blocked.is_empty() {
+        println!("  Blocked:");
+        for blocked in &plan.blocked {
+            println!("    {}: {}", blocked.span_id.0, blocked.reason);
+        }
+    }
+    for warning in &plan.warnings {
+        println!("  Warning: {warning}");
+    }
+}
+
+fn cmd_workspace_diff<S: Storage, E: replaykit_replay_engine::ExecutorRegistry>(
+    service: &ReplayKitService<S, E>,
+    source: &str,
+    target: &str,
+    json: bool,
+) {
+    let changes = service
+        .workspace_diff(&RunId(source.into()), &RunId(target.into()))
+        .unwrap_or_else(|e| die(e));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&changes).unwrap());
+        return;
+    }
+    if changes.is_empty() {
+        println!("Workspaces are identical.");
+        return;
+    }
+    for change in &changes {
+        println!("  {:?} {}", change.change, change.path);
+    }
 }
 
 fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorRegistry>(
@@ -586,6 +711,7 @@ fn cmd_replay_plan<S: Storage + 'static, E: replaykit_replay_engine::ExecutorReg
             .collect();
         println!("    {} [{}]", dirty.span_id.0, reasons.join(", "));
     }
+    print_blocked_and_warnings(&plan);
 }
 
 fn cmd_serve<S: Storage + 'static, E: replaykit_replay_engine::ExecutorRegistry + 'static>(

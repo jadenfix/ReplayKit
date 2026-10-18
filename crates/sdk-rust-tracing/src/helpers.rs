@@ -181,8 +181,8 @@ impl SpanBuilder {
 
     /// Set the model provider name (LlmCall spans).
     ///
-    /// **Recommended for replay.** Needed for live model dispatch via
-    /// `PassthroughModelExecutor`. Omitting produces a contract warning.
+    /// **Recommended for replay.** Passed to a provider command
+    /// (`ModelExecutorMode::Command`). Omitting produces a contract warning.
     pub fn provider(mut self, name: impl Into<String>) -> Self {
         self.spec
             .attributes
@@ -209,6 +209,47 @@ impl SpanBuilder {
         self.spec
             .attributes
             .insert(attrs::MODEL_REQUEST_JSON.into(), Value::Text(json.into()));
+        self
+    }
+
+    /// Set the prompt sent to the model (LlmCall spans).
+    ///
+    /// **Recommended for replay.** `PromptEdit` patches replace it, and the
+    /// recorded-response model executor matches on it.
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.spec
+            .attributes
+            .insert(attrs::PROMPT.into(), Value::Text(prompt.into()));
+        self
+    }
+
+    /// Extra environment variables the span ran with (shell/tool spans).
+    pub fn env_var(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        let entry = self
+            .spec
+            .attributes
+            .entry(attrs::ENV.into())
+            .or_insert_with(|| Value::Object(Document::new()));
+        if let Value::Object(env) = entry {
+            env.insert(name.into(), Value::Text(value.into()));
+        }
+        self
+    }
+
+    /// Bind an input attribute to upstream outputs with a template such as
+    /// `"pytest {{select_tests|words}}"`. On replay the attribute is
+    /// re-rendered from the replayed outputs of the referenced spans, so
+    /// patched upstream outputs reach this span's executor. Also record a
+    /// `DataDependsOn` edge to each referenced span.
+    pub fn bind_input(mut self, attribute: impl Into<String>, template: impl Into<String>) -> Self {
+        let entry = self
+            .spec
+            .attributes
+            .entry(attrs::INPUT_BINDINGS.into())
+            .or_insert_with(|| Value::Object(Document::new()));
+        if let Value::Object(bindings) = entry {
+            bindings.insert(attribute.into(), Value::Text(template.into()));
+        }
         self
     }
 

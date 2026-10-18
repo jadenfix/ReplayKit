@@ -91,6 +91,18 @@ pub mod attrs {
     pub const MODEL: &str = "model";
     /// Serialized model request JSON (for `LlmCall` spans).
     pub const MODEL_REQUEST_JSON: &str = "model_request_json";
+    /// Prompt text sent to the model (for `LlmCall` spans).
+    pub const PROMPT: &str = "prompt";
+    /// Extra environment variables the span ran with: an object of
+    /// `NAME -> value`, or `NAME=value` lines (for `ShellCommand`/`ToolCall`).
+    pub const ENV: &str = "env";
+    /// Input bindings: an object mapping an attribute name (`command`,
+    /// `content`, `prompt`, ...) to a template such as
+    /// `"python3 run_tests.py {{select_tests|words}}"`. On replay the
+    /// template is re-rendered from the *replayed* outputs of the referenced
+    /// upstream spans, so patched or re-executed upstream outputs flow into
+    /// downstream executors. Supported filters: `trim`, `words`.
+    pub const INPUT_BINDINGS: &str = "input_bindings";
 }
 
 impl fmt::Display for Value {
@@ -173,6 +185,12 @@ pub enum PatchType {
     ModelConfigEdit,
     RetrievalContextOverride,
     SnapshotOverride,
+    /// Replace the command (and optionally cwd/env) of a `ShellCommand` or
+    /// `ToolCall` span before it is re-executed.
+    CommandOverride,
+    /// Replace the content a `FileWrite` span writes, or the content a
+    /// `FileRead` span observed.
+    FileContentOverride,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +315,11 @@ pub struct RunRecord {
     pub host: HostMetadata,
     pub labels: Vec<String>,
     pub summary: RunSummary,
+    /// Directory the agent worked in. When set, the collector captures a
+    /// workspace snapshot at every span boundary so replays can run in a
+    /// hermetic sandbox restored from the recorded state.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -444,6 +467,23 @@ pub struct BranchPlan {
     pub dirty_spans: Vec<DirtySpanRecord>,
     pub blocked_spans: Vec<SpanId>,
     pub reusable_spans: Vec<SpanId>,
+    /// Why each blocked span cannot run, as reported by the executor
+    /// registry that will execute the fork (same order as `blocked_spans`).
+    #[serde(default)]
+    pub blocked: Vec<BlockedSpanRecord>,
+    /// Non-fatal caveats about the replay (e.g. no workspace snapshot).
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Container spans (run, planner steps) that are not re-executed but
+    /// whose status is re-derived from their replayed descendants.
+    #[serde(default)]
+    pub rollup_spans: Vec<SpanId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedSpanRecord {
+    pub span_id: SpanId,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +520,7 @@ impl RunRecord {
             host: HostMetadata::default(),
             labels: Vec::new(),
             summary: RunSummary::default(),
+            workspace_root: None,
         }
     }
 }

@@ -71,6 +71,7 @@ fn seed_run<S: Storage, E: ExecutorRegistry>(
                 hostname: None,
             },
             labels: Vec::new(),
+            workspace_root: None,
         })
         .unwrap();
 
@@ -269,6 +270,7 @@ fn seeded_server_with_failed_dependency() -> (TestServer, RunId) {
                 hostname: None,
             },
             labels: Vec::new(),
+            workspace_root: None,
         })
         .unwrap();
 

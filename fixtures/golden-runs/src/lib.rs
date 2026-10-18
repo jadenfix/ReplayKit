@@ -948,7 +948,7 @@ mod tests {
             patch_manifest: PatchManifest {
                 patch_type: PatchType::EnvVarOverride,
                 target_artifact_id: None,
-                replacement: Value::Text("patched output".into()),
+                replacement: Value::Text("REPLAY_MODE=patched".into()),
                 note: Some("test missing content".into()),
                 created_at: 900,
             },

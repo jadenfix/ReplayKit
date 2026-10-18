@@ -280,16 +280,25 @@ fn spans_differ(
     }
 }
 
+/// Workspace snapshots and patch manifests are replay bookkeeping, not span
+/// outputs, so they do not count as changed artifacts.
+fn is_replay_bookkeeping(artifact: &replaykit_core_model::ArtifactRecord) -> bool {
+    artifact.mime == replaykit_storage::workspace::WORKSPACE_ARCHIVE_MIME
+        || artifact.artifact_type == replaykit_core_model::ArtifactType::PatchManifest
+}
+
 fn count_changed_artifacts(
     source_artifacts: &[replaykit_core_model::ArtifactRecord],
     target_artifacts: &[replaykit_core_model::ArtifactRecord],
 ) -> usize {
     let source = source_artifacts
         .iter()
+        .filter(|artifact| !is_replay_bookkeeping(artifact))
         .map(|artifact| (artifact.artifact_id.clone(), artifact.sha256.clone()))
         .collect::<BTreeMap<_, _>>();
     let target = target_artifacts
         .iter()
+        .filter(|artifact| !is_replay_bookkeeping(artifact))
         .map(|artifact| (artifact.artifact_id.clone(), artifact.sha256.clone()))
         .collect::<BTreeMap<_, _>>();
 

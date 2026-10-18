@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -117,6 +117,7 @@ impl SemanticSession {
                 hostname: None,
             },
             labels: vec!["sdk".into()],
+            workspace_root: None,
         })?;
 
         let run_id = run.run_id.clone();

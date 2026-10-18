@@ -2,6 +2,7 @@ pub mod server;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use replaykit_core_model::{
@@ -10,6 +11,7 @@ use replaykit_core_model::{
     RunRecord, RunStatus, RunSummary, SnapshotId, SnapshotRecord, SpanEdgeRecord, SpanId, SpanKind,
     SpanRecord, SpanStatus, TraceId, Value,
 };
+use replaykit_storage::workspace::{CaptureOptions, WorkspacePhase, capture_workspace_point};
 use replaykit_storage::{Storage, StorageError};
 
 #[derive(Debug)]
@@ -44,6 +46,10 @@ pub struct BeginRun {
     pub environment_fingerprint: Option<String>,
     pub host: HostMetadata,
     pub labels: Vec<String>,
+    /// Directory the agent works in. When set, the collector captures a
+    /// workspace snapshot before and after every span and when the run
+    /// finishes, so forked replays can restore the exact recorded state.
+    pub workspace_root: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,11 +122,58 @@ pub struct EdgeSpec {
 
 pub struct Collector<S: Storage> {
     storage: Arc<S>,
+    capture: CaptureOptions,
 }
 
 impl<S: Storage> Collector<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            capture: CaptureOptions::default(),
+        }
+    }
+
+    /// Never capture these absolute paths in workspace snapshots (for
+    /// example the collector's own data root when it lives in the workspace).
+    pub fn with_workspace_excludes(mut self, exclude: Vec<PathBuf>) -> Self {
+        self.capture.exclude = exclude;
+        self
+    }
+
+    /// Cap the bytes captured in a single workspace snapshot.
+    pub fn with_workspace_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.capture.max_bytes = max_bytes;
+        self
+    }
+
+    /// Capture the run's workspace (if it declared one) as the next snapshot
+    /// point. Capture problems are logged and never fail the recording.
+    fn capture_workspace(
+        &self,
+        run: &RunRecord,
+        span_id: Option<&SpanId>,
+        phase: WorkspacePhase,
+        at: u64,
+    ) {
+        let Some(root) = &run.workspace_root else {
+            return;
+        };
+        if let Err(err) = capture_workspace_point(
+            &*self.storage,
+            &run.run_id,
+            span_id,
+            phase,
+            Path::new(root),
+            &self.capture,
+            at,
+        ) {
+            tracing::warn!(
+                run_id = %run.run_id.0,
+                phase = phase.label(),
+                error = %err,
+                "workspace snapshot capture failed"
+            );
+        }
     }
 
     pub fn storage(&self) -> &Arc<S> {
@@ -143,6 +196,19 @@ impl<S: Storage> Collector<S> {
         run.environment_fingerprint = request.environment_fingerprint;
         run.host = request.host;
         run.labels = request.labels;
+        if let Some(root) = request.workspace_root {
+            let canonical = std::fs::canonicalize(&root).map_err(|err| {
+                CollectorError::InvalidInput(format!(
+                    "workspace_root {root:?} is not usable: {err}"
+                ))
+            })?;
+            if !canonical.is_dir() {
+                return Err(CollectorError::InvalidInput(format!(
+                    "workspace_root {root:?} is not a directory"
+                )));
+            }
+            run.workspace_root = Some(canonical.to_string_lossy().into_owned());
+        }
         self.storage.insert_run(run.clone())?;
         Ok(run)
     }
@@ -206,13 +272,17 @@ impl<S: Storage> Collector<S> {
             cost: CostMetrics::default(),
         };
         self.storage.upsert_span(span.clone())?;
-        if span.parent_span_id.is_none() {
-            let mut run = self.storage.get_run(run_id)?;
-            if run.root_span_id.is_none() {
-                run.root_span_id = Some(span.span_id.clone());
-                self.storage.update_run(run)?;
-            }
+        let mut run = self.storage.get_run(run_id)?;
+        if span.parent_span_id.is_none() && run.root_span_id.is_none() {
+            run.root_span_id = Some(span.span_id.clone());
+            self.storage.update_run(run.clone())?;
         }
+        self.capture_workspace(
+            &run,
+            Some(&span.span_id),
+            WorkspacePhase::Before,
+            span.started_at,
+        );
         Ok(span)
     }
 
@@ -266,6 +336,13 @@ impl<S: Storage> Collector<S> {
         span.error_summary = update.error_summary;
         span.cost = update.cost;
         self.storage.upsert_span(span.clone())?;
+        let run = self.storage.get_run(run_id)?;
+        self.capture_workspace(
+            &run,
+            Some(&span.span_id),
+            WorkspacePhase::After,
+            update.ended_at,
+        );
         Ok(span)
     }
 
@@ -397,6 +474,7 @@ impl<S: Storage> Collector<S> {
                 run_id.0
             )));
         }
+        self.capture_workspace(&run, None, WorkspacePhase::End, ended_at);
         let artifacts = self.storage.list_artifacts(run_id)?;
         let preview = final_output_preview.or_else(|| run.summary.final_output_preview.clone());
         run.ended_at = Some(ended_at);
@@ -583,6 +661,8 @@ pub fn patch_type_label(value: PatchType) -> &'static str {
         PatchType::ModelConfigEdit => "model-config-edit",
         PatchType::RetrievalContextOverride => "retrieval-context-override",
         PatchType::SnapshotOverride => "snapshot-override",
+        PatchType::CommandOverride => "command-override",
+        PatchType::FileContentOverride => "file-content-override",
     }
 }
 
@@ -613,6 +693,7 @@ mod tests {
                 hostname: None,
             },
             labels: Vec::new(),
+            workspace_root: None,
         }
     }
 
