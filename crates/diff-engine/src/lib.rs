@@ -67,6 +67,7 @@ impl<S: Storage> DiffEngine<S> {
             .collect::<Vec<_>>();
 
         let mut first_divergent_span_id = None;
+        let mut first_divergent_container: Option<SpanId> = None;
         let mut changed_span_count = 0usize;
         let mut span_diffs = Vec::new();
 
@@ -75,11 +76,29 @@ impl<S: Storage> DiffEngine<S> {
             let target_span = target_map.get(span_id);
             if spans_differ(source_span, target_span) {
                 changed_span_count += 1;
-                if first_divergent_span_id.is_none() {
+                // Containers (runs, planner steps) only re-derive their
+                // status from children; the first divergence is the first
+                // span that actually did something different.
+                let is_container = source_span.or(target_span).is_some_and(|span| {
+                    matches!(
+                        span.kind,
+                        replaykit_core_model::SpanKind::Run
+                            | replaykit_core_model::SpanKind::PlannerStep
+                            | replaykit_core_model::SpanKind::Subgraph
+                    )
+                });
+                if !is_container && first_divergent_span_id.is_none() {
                     first_divergent_span_id = Some(span_id.clone());
+                }
+                if is_container {
+                    first_divergent_container.get_or_insert_with(|| span_id.clone());
                 }
                 span_diffs.push(build_span_diff(span_id, source_span, target_span));
             }
+        }
+
+        if first_divergent_span_id.is_none() {
+            first_divergent_span_id = first_divergent_container;
         }
 
         let changed_artifact_count = count_changed_artifacts(&source_artifacts, &target_artifacts);

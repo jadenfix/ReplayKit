@@ -158,6 +158,13 @@ fn run_shell(
         Stdio::null()
     });
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own process group, so a timeout can stop everything the command
+    // started (not just the shell).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn()?;
 
     let writer = stdin.and_then(|bytes| {
@@ -187,6 +194,13 @@ fn run_shell(
             break status;
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{}", child.id()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             let _ = child.kill();
             timed_out = true;
             break child.wait()?;
@@ -1462,7 +1476,7 @@ mod tests {
 
     #[test]
     fn shell_executor_honors_timeout() {
-        let mut span = make_span(SpanKind::ShellCommand, "sleep 5");
+        let mut span = make_span(SpanKind::ShellCommand, "sleep 5; echo never");
         span.attributes
             .insert(attrs::TIMEOUT_MS.into(), Value::Int(100));
         let started = Instant::now();
